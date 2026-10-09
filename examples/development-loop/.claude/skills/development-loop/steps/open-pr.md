@@ -9,7 +9,7 @@ Push the feature branch and open one pull request that a reviewer can understand
 ## Inputs
 
 - `jira-context.md` and `requirements.md`
-- Every subtask's `implementation.md` and `review.md`
+- Every subtask's `implementation.md` and its two reviews (`review-correctness.md`, `review-verification.md`)
 - The feature branch with one commit per subtask attempt
 
 ## Outputs

@@ -1,6 +1,6 @@
 # Step: implement (one subtask)
 
-Part of the `development-loop` flow. You run as a subagent for **one** subtask. The orchestrator gives you the subtask, the input files, your output path, and the reviewer's feedback when this is a retry.
+Part of the `development-loop` flow. You run as a subagent for **one** subtask. The orchestrator gives you the subtask, the input files, your output path, and the reviewers' feedback when this is a retry.
 
 ## Goal
 
@@ -10,7 +10,7 @@ Implement exactly this subtask so that all of its verification points pass, with
 
 - The work item: this subtask's JSON, with `goal`, `verification`, `depends_on` and `files`.
 - `requirements.md`, `plan.md` and `subtasks.json`, for context. Implement only *this* subtask.
-- On a retry: the previous `review.md` for this subtask and the feedback from gate G3. Every point in them must be addressed.
+- On a retry: the previous reviews for this subtask (`review-correctness.md` and `review-verification.md`) and the feedback from gate G3. Every point in them must be addressed.
 
 ## Outputs
 

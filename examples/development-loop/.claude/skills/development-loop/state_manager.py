@@ -12,13 +12,17 @@ Stdlib only (Python 3.9+). Every command prints JSON except `status`.
     state_manager.py --run PROJ-123 init --input story=PROJ-123
     state_manager.py --run PROJ-123 next
     state_manager.py --run PROJ-123 start    <step>
-    state_manager.py --run PROJ-123 complete <step> [--artifact PATH ...] [--summary TEXT]
+    state_manager.py --run PROJ-123 complete <step> [--agent ID] [--artifact PATH ...] [--summary TEXT]
     state_manager.py --run PROJ-123 approve  <gate-or-step> [--note TEXT]
     state_manager.py --run PROJ-123 reject   <gate-or-step> --feedback TEXT
     state_manager.py --run PROJ-123 status
 
 Step paths are `step_id` for single steps and `step_id[ITEM].cycle_step_id` for
 the cycle steps of a foreach, e.g. `subtasks[T2].implement`.
+
+A step with an `agents` list runs several subagents in parallel (e.g. two
+reviewers). `start` starts them all, each reports with `complete --agent ID`,
+and the step finishes (or reaches its gate) once every agent has reported.
 """
 from __future__ import annotations
 
@@ -114,6 +118,9 @@ def validate_flow(flow: Any) -> list[str]:
         errors.append("'defaults' must be an object")
         defaults = {}
     _check_options(defaults, "defaults", errors)
+    orch = flow.get("orchestrator", {})
+    if not isinstance(orch, dict) or not all(isinstance(v, str) for v in orch.values()):
+        errors.append("'orchestrator' must map agent settings (e.g. model, color) to strings")
 
     steps = flow.get("steps")
     if not isinstance(steps, list) or not steps:
@@ -196,17 +203,75 @@ def _check_options(obj: dict, where: str, errors: list[str]) -> None:
         errors.append(f"{where}: 'max_iterations' must be a positive integer")
     if "run_in_subagent" in obj and not isinstance(obj["run_in_subagent"], bool):
         errors.append(f"{where}: 'run_in_subagent' must be true or false")
+    if "subagent_type" in obj and (not isinstance(obj["subagent_type"], str) or not obj["subagent_type"]):
+        errors.append(f"{where}: 'subagent_type' must be an agent name, e.g. 'general-purpose'")
+
+
+def _valid_artifacts(arts: Any) -> bool:
+    return isinstance(arts, list) and all(
+        isinstance(a, str) and a and not a.startswith("/") and ".." not in Path(a).parts for a in arts
+    )
+
+
+def agent_artifacts(unit_def: dict, agent_def: dict) -> list[str]:
+    """Artifact names of one parallel agent: its own list, or the step's list
+    with {agent} replaced by the agent id."""
+    if "artifacts" in agent_def:
+        return list(agent_def["artifacts"])
+    return [a.replace("{agent}", agent_def["id"]) for a in unit_def.get("artifacts", [])]
+
+
+def unit_artifacts(unit_def: dict) -> list[str]:
+    """Every artifact name a step produces (all agents' for a parallel step)."""
+    if unit_def.get("agents"):
+        return [a for ad in unit_def["agents"] for a in agent_artifacts(unit_def, ad)]
+    return list(unit_def.get("artifacts", []))
 
 
 def _check_unit(unit: dict, where: str, errors: list[str], gate_ids: set[str]) -> None:
     if not isinstance(unit.get("skill"), str) or not unit["skill"]:
         errors.append(f"{where}: 'skill' (path of the step's instructions) is required")
     arts = unit.get("artifacts", [])
-    if not isinstance(arts, list) or not all(
-        isinstance(a, str) and a and not a.startswith("/") and ".." not in Path(a).parts for a in arts
-    ):
+    if not _valid_artifacts(arts):
         errors.append(f"{where}: 'artifacts' must be a list of relative file names")
         arts = []
+    agents = unit.get("agents")
+    if agents is None:
+        if any("{agent}" in a for a in arts):
+            errors.append(f"{where}: '{{agent}}' in artifact names needs an 'agents' list")
+    elif not isinstance(agents, list) or not agents:
+        errors.append(f"{where}: 'agents' must be a non-empty list of parallel subagents")
+    else:
+        if unit.get("run_in_subagent") is False:
+            errors.append(f"{where}: parallel 'agents' always run as subagents; drop run_in_subagent: false")
+        if "produces_items" in unit:
+            errors.append(f"{where}: a step with parallel 'agents' cannot produce items")
+        agent_ids: list[str] = []
+        for k, ad in enumerate(agents):
+            if not isinstance(ad, dict) or not isinstance(ad.get("id"), str) or not ID_RE.match(ad["id"]):
+                errors.append(f"{where}: agents[{k}] 'id' must be snake_case")
+                continue
+            awhere = f"{where} agent '{ad['id']}'"
+            if ad["id"] in agent_ids:
+                errors.append(f"{awhere}: duplicate id")
+            agent_ids.append(ad["id"])
+            if "skill" in ad and (not isinstance(ad["skill"], str) or not ad["skill"]):
+                errors.append(f"{awhere}: 'skill' must be a path")
+            if "focus" in ad and not isinstance(ad["focus"], str):
+                errors.append(f"{awhere}: 'focus' must be text")
+            if "artifacts" in ad and not _valid_artifacts(ad["artifacts"]):
+                errors.append(f"{awhere}: 'artifacts' must be a list of relative file names")
+                continue
+            _check_options({k: v for k, v in ad.items() if k == "subagent_type"}, awhere, errors)
+            if not agent_artifacts(unit, ad):
+                errors.append(f"{awhere}: produces no artifacts; give it 'artifacts' or use '{{agent}}' in the step's")
+        if all(isinstance(ad, dict) and isinstance(ad.get("id"), str) for ad in agents):
+            names = unit_artifacts(unit)
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            if dupes:
+                errors.append(f"{where}: parallel agents would write the same file ({', '.join(dupes)}); "
+                              "put '{agent}' in the step's artifact names or give each agent its own")
+            arts = names
     gate = unit.get("gate")
     if gate is None:
         return
@@ -381,7 +446,13 @@ def fresh_unit(unit_def: dict) -> dict:
     gate = unit_def.get("gate")
     if gate:
         unit["gate"] = {"id": gate["id"], "when": gate.get("when", "after"), "status": "pending", "decisions": []}
+    if unit_def.get("agents"):
+        unit["agents"] = {ad["id"]: fresh_agent() for ad in unit_def["agents"]}
     return unit
+
+
+def fresh_agent() -> dict:
+    return {"status": "pending", "artifacts": [], "summary": None, "error": None, "started_at": None, "completed_at": None}
 
 
 def fresh_step_state(step_def: dict) -> dict:
@@ -509,6 +580,12 @@ class Run:
 
     def _art(self, name: str, unit: Unit) -> str:
         return name.replace("{item}", unit.item["id"]) if unit.item else name
+
+    def _subagent_type(self, *sources: dict) -> str:
+        for src in (*sources, self.flow.get("defaults", {})):
+            if "subagent_type" in src:
+                return src["subagent_type"]
+        return "general-purpose"
 
     def _abs(self, p: str) -> str:
         return p if os.path.isabs(p) else str(self.artifacts_dir / p)
@@ -638,11 +715,13 @@ class Run:
             "action": "run_step",
             "step": unit.path,
             "skill": str(self.flow_path.parent / ud["skill"]),
-            "run_in_subagent": ud.get("run_in_subagent", unit.step_def.get("run_in_subagent", defaults.get("run_in_subagent", True))),
+            "run_in_subagent": bool(ud.get("agents")) or ud.get(
+                "run_in_subagent", unit.step_def.get("run_in_subagent", defaults.get("run_in_subagent", True))),
+            "subagent_type": self._subagent_type(ud, unit.step_def),
             "attempt": st["attempt"] if running else st["attempt"] + 1,
             "resumed": running,
             "inputs": self._inputs(unit),
-            "outputs": [self._abs(self._art(a, unit)) for a in ud.get("artifacts", [])],
+            "outputs": [self._abs(self._art(a, unit)) for a in unit_artifacts(ud)],
             "feedback": st["feedback"],
             "run": self.state["run_id"],
             "run_inputs": self.state["inputs"],
@@ -655,11 +734,28 @@ class Run:
             act["items_file"] = self._abs(pi["file"])
             if pi.get("item_schema"):
                 act["item_schema"] = self.flow["item_schemas"][pi["item_schema"]]
-        act["commands"] = {
-            "start": f"{self.cli} start {shlex.quote(unit.path)}",
-            "complete": f"{self.cli} complete {shlex.quote(unit.path)} --summary '<one line>'",
-            "fail": f"{self.cli} fail {shlex.quote(unit.path)} --reason '<why it cannot be done>'",
-        }
+        q = shlex.quote(unit.path)
+        act["commands"] = {"start": f"{self.cli} start {q}"}
+        if ud.get("agents"):
+            # One subagent per entry, all launched at once. Agents already done
+            # (e.g. before an interruption or a failed sibling) are not listed.
+            act["agents"] = [
+                {
+                    "agent": ad["id"],
+                    "skill": str(self.flow_path.parent / ad.get("skill", ud["skill"])),
+                    "focus": ad.get("focus"),
+                    "subagent_type": self._subagent_type(ad, ud, unit.step_def),
+                    "outputs": [self._abs(self._art(a, unit)) for a in agent_artifacts(ud, ad)],
+                    "commands": {
+                        "complete": f"{self.cli} complete {q} --agent {ad['id']} --summary '<one line>'",
+                        "fail": f"{self.cli} fail {q} --agent {ad['id']} --reason '<why it cannot be done>'",
+                    },
+                }
+                for ad in ud["agents"] if st["agents"][ad["id"]]["status"] != "done"
+            ]
+        else:
+            act["commands"]["complete"] = f"{self.cli} complete {q} --summary '<one line>'"
+            act["commands"]["fail"] = f"{self.cli} fail {q} --reason '<why it cannot be done>'"
         return act
 
     def _gate_action(self, unit: Unit) -> dict:
@@ -694,18 +790,51 @@ class Run:
             if act["action"] != "run_step" or act["step"] != unit.path:
                 raise EngineError(f"'{unit.path}' cannot start now; the next action is {_brief(act)}")
             st.update(status="running", attempt=st["attempt"] + 1, started_at=now(), completed_at=None, error=None)
+            for ag in st.get("agents", {}).values():
+                if ag["status"] != "done":
+                    ag.update(status="running", started_at=now(), completed_at=None, error=None)
             self._refresh_item(unit)
             self._event("start", step=unit.path, attempt=st["attempt"])
-        return {"ok": True, "step": unit.path, "status": "running", "attempt": st["attempt"]}
+        res = {"ok": True, "step": unit.path, "status": "running", "attempt": st["attempt"]}
+        if "agents" in st:
+            res["agents"] = [aid for aid, ag in st["agents"].items() if ag["status"] == "running"]
+        return res
 
-    def complete(self, path: str, extra: tuple = (), summary: Optional[str] = None) -> dict:
+    def complete(self, path: str, extra: tuple = (), summary: Optional[str] = None, agent: Optional[str] = None) -> dict:
         unit = self.resolve(path)
         st = unit.st
         if st["status"] != "running":
             raise EngineError(f"'{unit.path}' is {st['status']}, not running; call `start {unit.path}` first")
+        ad, ag = self._agent(unit, agent)
+        names = agent_artifacts(unit.unit_def, ad) if ad else unit.unit_def.get("artifacts", [])
+        arts = self._collect_artifacts(unit, names, extra)
+        if ag is not None:
+            ag.update(status="done", artifacts=arts, summary=summary, completed_at=now())
+            self._event("complete", step=unit.path, agent=agent, artifacts=arts, summary=summary)
+            return self._settle_agents(unit)
+        return self._finish(unit, arts, summary)
+
+    def _agent(self, unit: Unit, agent: Optional[str]) -> tuple[Optional[dict], Optional[dict]]:
+        """Resolve --agent: required for steps with parallel agents, refused otherwise."""
+        agents = unit.unit_def.get("agents")
+        if not agents:
+            if agent:
+                raise EngineError(f"'{unit.path}' has no parallel agents; drop --agent")
+            return None, None
+        ids = [a["id"] for a in agents]
+        if not agent:
+            raise EngineError(f"'{unit.path}' runs parallel agents ({', '.join(ids)}); report each with --agent <id>")
+        if agent not in ids:
+            raise EngineError(f"'{unit.path}' has no agent '{agent}'; agents are: {', '.join(ids)}")
+        ag = unit.st["agents"][agent]
+        if ag["status"] != "running":
+            raise EngineError(f"agent '{agent}' of '{unit.path}' is {ag['status']}, not running")
+        return next(a for a in agents if a["id"] == agent), ag
+
+    def _collect_artifacts(self, unit: Unit, names: list[str], extra: tuple) -> list[str]:
         arts: list[str] = []
         missing: list[str] = []
-        for name in unit.unit_def.get("artifacts", []):
+        for name in names:
             rel = self._art(name, unit)
             if not (self.artifacts_dir / rel).is_file():
                 missing.append(str(self.artifacts_dir / rel))
@@ -724,10 +853,30 @@ class Run:
                 arts.append(str(pp))
         if missing:
             raise EngineError("missing artifacts (write them, then complete again):\n- " + "\n- ".join(missing))
+        return list(dict.fromkeys(arts))
+
+    def _settle_agents(self, unit: Unit) -> dict:
+        """After one parallel agent reports: wait for the rest, then finish or fail the step."""
+        agents = unit.st["agents"]
+        running = [aid for aid, ag in agents.items() if ag["status"] == "running"]
+        if running:
+            return {"ok": True, "step": unit.path, "status": "running", "waiting_for": running}
+        failed = {aid: ag["error"] for aid, ag in agents.items() if ag["status"] == "failed"}
+        if failed:
+            unit.st.update(status="failed", error="; ".join(f"agent '{a}' failed: {e}" for a, e in failed.items()))
+            self._refresh_item(unit)
+            self._event("fail", step=unit.path, agents=list(failed))
+            return {"ok": True, "step": unit.path, "status": "failed", "next": self.next_action()}
+        arts = [p for ag in agents.values() for p in ag["artifacts"]]
+        summary = " | ".join(f"{aid}: {ag['summary']}" for aid, ag in agents.items() if ag["summary"]) or None
+        return self._finish(unit, list(dict.fromkeys(arts)), summary)
+
+    def _finish(self, unit: Unit, arts: list[str], summary: Optional[str]) -> dict:
+        st = unit.st
         pi = unit.unit_def.get("produces_items")
         if pi:
             check_items(self.flow, pi, read_json(self.artifacts_dir / pi["file"], pi["file"]))
-        st.update(artifacts=list(dict.fromkeys(arts)), summary=summary, completed_at=now())
+        st.update(artifacts=arts, summary=summary, completed_at=now())
         gate = st.get("gate")
         if gate and gate["when"] == "after":
             st["status"] = "awaiting_gate"
@@ -739,8 +888,13 @@ class Run:
         self._event("complete", step=unit.path, artifacts=st["artifacts"], summary=summary)
         return {"ok": True, "step": unit.path, "status": st["status"], "next": self.next_action()}
 
-    def fail(self, path: str, reason: str) -> dict:
+    def fail(self, path: str, reason: str, agent: Optional[str] = None) -> dict:
         unit = self.resolve(path)
+        if agent is not None or (unit.unit_def.get("agents") and unit.st["status"] == "running"):
+            _, ag = self._agent(unit, agent)
+            ag.update(status="failed", error=reason, completed_at=now())
+            self._event("fail", step=unit.path, agent=agent, reason=reason)
+            return self._settle_agents(unit)
         if unit.st["status"] != "running":
             act = self.next_action()
             if act.get("step") != unit.path or unit.st["status"] != "pending":
@@ -790,6 +944,9 @@ class Run:
         unit.st.update(status="pending", attempt=0, error=None)
         if unit.st.get("gate") and unit.st["gate"]["status"] == "rejected":
             unit.st["gate"]["status"] = "pending"
+        for ag in unit.st.get("agents", {}).values():  # agents that finished keep their work
+            if ag["status"] != "done":
+                ag.update(fresh_agent())
         self._refresh_item(unit)
         self._event("retry", step=unit.path)
         return {"ok": True, "step": unit.path, "next": self.next_action()}
@@ -871,6 +1028,8 @@ class Run:
                 info += " · has feedback"
             if st["status"] == "failed" and st["error"]:
                 info += f" · {st['error']}"
+            if st.get("agents"):
+                info += " · agents: " + ", ".join(f"{aid} {ag['status']}" for aid, ag in st["agents"].items())
             return f"{indent}[{marks[st['status']]}] {label:<24} {info}"
 
         for sdef in self.flow["steps"]:
@@ -895,6 +1054,8 @@ def _reset_unit(st: dict) -> None:
     st.update(status="pending", artifacts=[], summary=None, error=None, started_at=None, completed_at=None)
     if st.get("gate"):
         st["gate"]["status"] = "pending"
+    for aid in st.get("agents", {}):
+        st["agents"][aid] = fresh_agent()
 
 
 def _brief(act: dict) -> str:
@@ -953,10 +1114,14 @@ def simulate(flow_path: Path, rejects: Optional[dict[str, int]] = None, max_acti
                     content = json.dumps(fake_items(flow, run.resolve(act["step"]).unit_def["produces_items"]), indent=2) \
                         if out == act.get("items_file") else "simulated\n"
                     atomic_write(Path(out), content)
-                where = "subagent" if act["run_in_subagent"] else "inline"
+                if act.get("agents"):
+                    where = f"{len(act['agents'])} parallel subagents: {', '.join(a['agent'] for a in act['agents'])}"
+                else:
+                    where = "subagent" if act["run_in_subagent"] else "inline"
                 fb = " (with feedback)" if act["feedback"] else ""
                 trace.append(f"run   {act['step']}  [attempt {act['attempt']}, {where}]{fb}")
-                run.complete(act["step"])
+                for agent in act.get("agents") or [None]:
+                    run.complete(act["step"], agent=agent and agent["agent"])
             elif act["action"] == "await_gate":
                 if rejects.get(act["gate"], 0) > 0:
                     rejects[act["gate"]] -= 1
@@ -1054,9 +1219,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("step")
     c.add_argument("--artifact", action="append", default=[], help="extra artifact path (declared ones are checked automatically)")
     c.add_argument("--summary")
+    c.add_argument("--agent", help="which parallel agent finished (steps with 'agents')")
     f = add("fail", "mark a step failed")
     f.add_argument("step")
     f.add_argument("--reason", required=True)
+    f.add_argument("--agent", help="which parallel agent failed (steps with 'agents')")
     a = add("approve", "approve the waiting gate")
     a.add_argument("target", help="gate id or step path")
     a.add_argument("--note")
@@ -1130,8 +1297,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             result = {
                 "next": lambda: run.next_action(),
                 "start": lambda: run.start(args.step),
-                "complete": lambda: run.complete(args.step, tuple(args.artifact), args.summary),
-                "fail": lambda: run.fail(args.step, args.reason),
+                "complete": lambda: run.complete(args.step, tuple(args.artifact), args.summary, args.agent),
+                "fail": lambda: run.fail(args.step, args.reason, args.agent),
                 "approve": lambda: run.approve(args.target, args.note),
                 "reject": lambda: run.reject(args.target, args.feedback),
                 "retry": lambda: run.retry(args.step),
