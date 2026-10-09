@@ -1,0 +1,98 @@
+{
+  "name": "development-loop",
+  "description": "Take a Jira story from context to pull request: requirements, decomposition into subtasks, an implement/review cycle per subtask, then a PR. Use when the user asks to develop, implement or deliver a Jira story end to end.",
+  "inputs": {
+    "story": "Jira issue key, e.g. PROJ-123"
+  },
+  "defaults": {
+    "run_in_subagent": true,
+    "max_iterations": 3
+  },
+  "item_schemas": {
+    "subtask": {
+      "type": "object",
+      "required": ["id", "title", "goal", "depends_on", "verification"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "goal": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "depends_on": { "type": "array", "items": { "type": "string" } },
+        "verification": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "files": { "type": "array", "items": { "type": "string" } },
+        "requirements": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "steps": [
+    {
+      "id": "jira_context",
+      "kind": "single",
+      "skill": "steps/jira-context.md",
+      "artifacts": ["jira-context.md"]
+    },
+    {
+      "id": "requirements",
+      "kind": "single",
+      "skill": "steps/requirements.md",
+      "needs": ["jira_context"],
+      "artifacts": ["requirements.md"],
+      "gate": {
+        "id": "G1",
+        "prompt": "Read requirements.md. Approve if it captures the story correctly and completely; otherwise reject and say what is wrong or missing."
+      }
+    },
+    {
+      "id": "decomposition",
+      "kind": "single",
+      "skill": "steps/decompose.md",
+      "needs": ["requirements"],
+      "inputs": ["jira_context", "requirements"],
+      "artifacts": ["subtasks.json", "plan.md"],
+      "produces_items": { "file": "subtasks.json", "key": "subtasks", "item_schema": "subtask" },
+      "gate": {
+        "id": "G2",
+        "prompt": "Review plan.md and subtasks.json: is each subtask small, ordered correctly, and verifiable? Approve, or reject with the changes you want."
+      }
+    },
+    {
+      "id": "subtasks",
+      "kind": "foreach",
+      "over": "decomposition",
+      "inputs": ["requirements", "decomposition"],
+      "respect_item_dependencies": true,
+      "max_iterations": 3,
+      "cycle": [
+        {
+          "id": "implement",
+          "skill": "steps/implement.md",
+          "artifacts": ["subtasks/{item}/implementation.md"]
+        },
+        {
+          "id": "review",
+          "skill": "steps/review.md",
+          "artifacts": ["subtasks/{item}/review.md"],
+          "gate": {
+            "id": "G3",
+            "on_reject": "implement",
+            "prompt": "Read the review of this subtask (and the diff if you want). Approve to move on, or reject with feedback to send it back to implementation."
+          }
+        }
+      ]
+    },
+    {
+      "id": "open_pr",
+      "kind": "single",
+      "skill": "steps/open-pr.md",
+      "needs": ["subtasks"],
+      "inputs": ["jira_context", "requirements", "subtasks"],
+      "artifacts": ["pr.md"],
+      "gate": {
+        "id": "G4",
+        "when": "before",
+        "prompt": "All subtasks are approved. Approve to push the branch and open the pull request.",
+        "guard": { "tool": "Bash", "pattern": "gh\\s+pr\\s+create" }
+      }
+    }
+  ]
+}
