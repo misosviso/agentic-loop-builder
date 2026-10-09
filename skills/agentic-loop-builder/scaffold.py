@@ -6,10 +6,13 @@
     scaffold.py generate FLOW.json --out .claude/skills/<name> [--install-path PATH]
                          [--agent-path PATH | --no-agent] [--force]
 
-`generate` writes the orchestrator agent to .claude/agents/<name>.md (kept if it
-exists, unless --force) and into --out:
+`generate` writes, next to the skills directory, .claude/agents/<name>.md (the
+orchestrator agent; kept if it exists, unless --force) and one
+.claude/agents/<subagent>.md per custom subagent in the flow's "subagents"
+(frontmatter always synced from flow.json, prompt body kept). Into --out:
 
-    SKILL.md            orchestrator (kept if it exists, unless --force)
+    SKILL.md            the /<name> command, which forks into the orchestrator agent
+                        (kept if it exists, unless --force)
     flow.json           copy of the flow definition
     state.schema.json   JSON Schema of this flow's state.json (always regenerated)
     state_manager.py    the generic engine (always refreshed)
@@ -44,8 +47,20 @@ def validate(flow_path: Path) -> tuple[dict, list[str]]:
             if not (flow_path.parent / skill).exists():
                 warnings.append(f"step skill {skill} does not exist yet (generate creates a stub)")
     if not flow.get("description"):
-        warnings.append("flow has no 'description'; the orchestrator skill needs one to be discovered")
+        warnings.append("flow has no 'description'; the command and agent need one")
+    elif len(flow["description"]) > MAX_DESCRIPTION:
+        warnings.append(f"flow description is {len(flow['description'])} characters; keep it under {MAX_DESCRIPTION}")
+    defined = set(flow.get("subagents", {}))
+    used = set(subagent_types(flow))
+    for name in sorted(used - defined - BUILTIN_AGENTS):
+        warnings.append(f"subagent_type '{name}' is not defined in 'subagents'; make sure .claude/agents/{name}.md exists")
+    for name in sorted(defined - used):
+        warnings.append(f"subagent '{name}' is defined but no step uses it")
     return flow, warnings
+
+
+MAX_DESCRIPTION = 200
+BUILTIN_AGENTS = {"general-purpose", "Explore", "Plan"}
 
 
 def iter_units(flow: dict):
@@ -183,10 +198,14 @@ def _gate_cell(udef: dict) -> str:
 
 
 def _subagent_cell(udef: dict, sdef: dict, flow: dict) -> str:
+    defaults = flow.get("defaults", {})
+    base = udef.get("subagent_type", sdef.get("subagent_type", defaults.get("subagent_type", "general-purpose")))
     if udef.get("agents"):
-        return f"{len(udef['agents'])} in parallel: " + ", ".join(f"`{a['id']}`" for a in udef["agents"])
-    default = flow.get("defaults", {}).get("run_in_subagent", True)
-    return "yes" if udef.get("run_in_subagent", sdef.get("run_in_subagent", default)) else "no"
+        return f"{len(udef['agents'])} in parallel: " + ", ".join(
+            f"`{a['id']}` ({a.get('subagent_type', base)})" for a in udef["agents"])
+    if not udef.get("run_in_subagent", sdef.get("run_in_subagent", defaults.get("run_in_subagent", True))):
+        return "inline"
+    return f"`{base}`"
 
 
 def steps_table(flow: dict, link_prefix: str = "") -> str:
@@ -242,22 +261,55 @@ def _yaml(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)  # a JSON string is a valid YAML scalar
 
 
+def _command(flow: dict) -> str:
+    return f"/{flow['name']}"
+
+
 def orchestrator_body(flow: dict, install_path: str, as_agent: bool) -> str:
     name = flow["name"]
+    cmd = _command(flow)
     inputs = flow.get("inputs", {})
     if as_agent:
-        role = (
-            "\n## Your role\n\n"
-            "You are the dedicated orchestrator agent for this flow, running as the main session "
-            f"(`claude --agent {name}`). You are an orchestrator **only**:\n\n"
-            "- You have no file-editing tools.\n"
-            "- Your shell is for the engine command. Use Read, Glob and Grep only to look at artifacts when presenting a gate.\n"
-            "- Every step, including any marked `run_in_subagent: false`, is done by subagents you launch.\n"
-        )
+        role = f"""
+## Your role
+
+You are the orchestrator agent of this flow, and an orchestrator **only**:
+
+- You have no file-editing tools.
+- Your shell is for the engine command. Use Read, Glob and Grep only to look at artifacts when presenting a gate.
+- Every step, including any marked `run_in_subagent: false`, is done by subagents you launch.
+
+You are started in one of two ways.
+
+### Command mode
+
+You are in command mode when your task says you were started by `{cmd}`. You run as a forked subagent and **cannot talk to the user**. Your task carries the arguments:
+
+```
+<RUN_ID>                                 start the run, or resume it
+<RUN_ID> approve <GATE> [note]           the user approved the waiting gate
+<RUN_ID> reject <GATE> <feedback>        the user rejected it
+<RUN_ID> retry <STEP>                    the user wants a failed step retried
+(nothing)                                list the runs
+```
+
+1. If a decision was given, apply it first with the engine (`approve`, `reject` or `retry`). Its words are the user's: pass them on unchanged as `--note` or `--feedback`.
+2. Then run the loop below until the engine returns `await_gate`, `failed` or `done`. These are the points where the procedure says to ask or tell the user.
+3. Stop there, and return a short report as your final answer. It should give:
+   - the run and where it stands;
+   - for a gate: its id, its prompt, the step summary, and the files to review, with one line on each;
+   - the exact commands the user can type next, e.g. `{cmd} <RUN_ID> approve <GATE> [note]` and `{cmd} <RUN_ID> reject <GATE> <what must change>`, or `{cmd} <RUN_ID> retry <STEP>`.
+
+Never approve or reject a gate that the arguments didn't decide.
+
+### Session mode
+
+You are in session mode when you run as the main session (`claude --agent {name}`). You talk to the user directly: follow the procedure as written, asking at every gate.
+"""
         inline = ""
     else:
-        role = (f"\nThis flow also ships as a dedicated orchestrator agent. To run it as its own session, "
-                f"use `claude --agent {name}`.\n")
+        role = (f"\nThis flow also ships as an orchestrator agent, so you can run it in its own session with "
+                f"`claude --agent {name}`.\n")
         inline = " If `run_in_subagent` is false, do the step yourself by following the `skill` file."
     return Template((TEMPLATES / "orchestrator.md.tmpl").read_text()).substitute(
         name=name,
@@ -272,12 +324,42 @@ def orchestrator_body(flow: dict, install_path: str, as_agent: bool) -> str:
     )
 
 
-def skill_md(flow: dict, install_path: str) -> str:
-    inputs = flow.get("inputs", {})
-    description = (flow.get("description") or f"Run the {flow['name']} flow.").replace("\n", " ")
-    hint = "<run-id>" + ("".join(f" [{k}]" for k in list(inputs)[1:]) if len(inputs) > 1 else "")
-    front = ["---", f"name: {flow['name']}", f"description: {_yaml(description)}", f"argument-hint: {_yaml(hint)}", "---", ""]
-    return "\n".join(front) + orchestrator_body(flow, install_path, as_agent=False)
+def _description(flow: dict) -> str:
+    return " ".join((flow.get("description") or f"Run the {flow['name']} flow.").split())
+
+
+def skill_md(flow: dict, install_path: str, with_agent: bool = True) -> str:
+    """The /<flow> command. With an agent, it forks into the orchestrator agent,
+    which advances the run to the next gate; otherwise it orchestrates inline."""
+    name = flow["name"]
+    if not with_agent:
+        front = ["---", f"name: {name}", f"description: {_yaml(_description(flow))}",
+                 f"argument-hint: {_yaml('<run-id>')}", "---", ""]
+        return "\n".join(front) + orchestrator_body(flow, install_path, as_agent=False)
+    cmd = _command(flow)
+    front = [
+        "---",
+        f"name: {name}",
+        f"description: {_yaml(_description(flow))}",
+        f"argument-hint: {_yaml('<run-id> [approve <gate> [note] | reject <gate> <feedback> | retry <step>]')}",
+        "context: fork",
+        f"agent: {name}",
+        "background: false",
+        "disable-model-invocation: true",
+        "---",
+        "",
+    ]
+    body = f"""You were started by the `{cmd}` command, so you are in **command mode**.
+
+Arguments: $ARGUMENTS
+
+Advance the `{name}` run named in the arguments, as your instructions describe:
+
+1. Apply the user's decision first, if the arguments carry one.
+2. Run the loop until the next gate, failure or the end of the flow.
+3. Return the report, with the exact `{cmd} …` commands the user can type next.
+"""
+    return "\n".join(front) + body
 
 
 def subagent_types(flow: dict) -> list[str]:
@@ -293,21 +375,66 @@ def subagent_types(flow: dict) -> list[str]:
 def agent_md(flow: dict, install_path: str) -> str:
     name = flow["name"]
     orch = flow.get("orchestrator", {})
-    what = (flow.get("description") or "").split(". Use when")[0].rstrip(".")
-    what = what[:1].lower() + what[1:]
-    description = (
-        f"Orchestrator for the {name} flow{': ' + what if what else ''}. "
-        "It only coordinates: it drives the state engine, launches a subagent per step (several in parallel where the flow says so) "
-        f"and stops at every gate for the user's decision. Start it as the main session with `claude --agent {name}`; "
-        "it needs the user at its gates, so do not delegate to it as a subagent."
-    )
+    description = (f"Orchestrator of the {name} flow: runs each step in subagents and stops at gates. "
+                   f"Started by {_command(flow)}; do not delegate to it.")
     tools = [f"Agent({', '.join(subagent_types(flow))})", "Bash", "Read", "Glob", "Grep", "AskUserQuestion"]
     front = ["---", f"name: {name}", f"description: {_yaml(description)}", f"tools: {', '.join(tools)}"]
     front += [f"{key}: {orch[key]}" for key in ("model", "color", "effort") if orch.get(key)]
-    initial = (f"Start or resume a run of the {name} flow. The run id is whatever follows this sentence; "
+    initial = (f"Session mode: start or resume a run of the {name} flow. The run id is whatever follows this sentence; "
                "if nothing follows, list the existing runs and ask me which one to resume or what new run id to start.")
     front += [f"initialPrompt: {_yaml(initial)}", "---", ""]
     return "\n".join(front) + orchestrator_body(flow, install_path, as_agent=True)
+
+
+def _frontmatter_value(value) -> str:
+    if isinstance(value, list):
+        return ", ".join(value) if all(isinstance(v, str) for v in value) else json.dumps(value)
+    return _yaml(value) if isinstance(value, str) and (":" in value or value != value.strip() or "#" in value) else str(value)
+
+
+def subagent_frontmatter(name: str, spec: dict) -> str:
+    lines = ["---", f"name: {name}", f"description: {_yaml(' '.join(spec['description'].split()))}"]
+    for key in sm.SUBAGENT_FIELDS:
+        if key != "description" and key in spec:
+            lines.append(f"{key}: {_frontmatter_value(spec[key])}")
+    return "\n".join(lines + ["---", ""])
+
+
+def subagent_body(flow: dict, name: str) -> str:
+    steps = [u["id"] for sdef, u in iter_units(flow)
+             if u.get("subagent_type", sdef.get("subagent_type", flow.get("defaults", {}).get("subagent_type"))) == name]
+    steps += [f"{u['id']} ({a['id']})" for _, u in iter_units(flow) for a in u.get("agents", []) if a.get("subagent_type") == name]
+    used = ", ".join(f"`{s}`" for s in dict.fromkeys(steps)) or "none yet"
+    return f"""
+You are `{name}`, a specialist subagent of the `{flow['name']}` flow. The flow's orchestrator launches you for these steps: {used}.
+
+## Role
+
+TODO: what you are an expert at, the conventions and quality bar you hold, and the tools you rely on.
+
+## How you work
+
+- Your task names a step instructions file. Read it first and follow it; it defines your inputs, outputs and done-criteria.
+- Write only to the output paths your task gives you. Never read or modify the run's `state.json` or call the state engine.
+- Finish with a reply of at most 5 lines: what you did, what you wrote, and anything the reviewer should look at.
+"""
+
+
+def write_subagent(path: Path, flow: dict, name: str) -> str:
+    """Write a custom subagent: frontmatter always follows flow.json, the body
+    (the agent's prompt) is kept once it exists."""
+    front = subagent_frontmatter(name, flow["subagents"][name])
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+        has_front = text.startswith("---\n") and "\n---\n" in text
+        new = front + (text.split("\n---\n", 1)[1] if has_front else text)
+        if new == text:
+            return "kept"
+        path.write_text(new, encoding="utf-8")
+        return "synced"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(front + subagent_body(flow, name), encoding="utf-8")
+    return "written"
 
 
 def step_stub(flow: dict, sdef: dict, udef: dict, agent: Optional[dict] = None) -> str:
@@ -391,7 +518,7 @@ def generate(flow_path: Path, out: Path, install_path: str = "", force: bool = F
     shutil.copyfile(HERE / "state_manager.py", out / "state_manager.py")
     written.append("state_manager.py")
     write("state.schema.json", json.dumps(state_schema(flow), indent=2) + "\n", overwrite=True)
-    write("SKILL.md", skill_md(flow, install_path), overwrite=force)
+    write("SKILL.md", skill_md(flow, install_path, with_agent), overwrite=force)
     for sdef, udef in iter_units(flow):
         write(udef["skill"], step_stub(flow, sdef, udef), overwrite=False)
         for ad in udef.get("agents", []):
@@ -406,8 +533,15 @@ def generate(flow_path: Path, out: Path, install_path: str = "", force: bool = F
             agent_file.parent.mkdir(parents=True, exist_ok=True)
             agent_file.write_text(agent_md(flow, install_path), encoding="utf-8")
             written.append(_rel(agent_file))
+    agents_dir = (agent_file or default_agent_path(out, flow["name"])).parent
+    subagents = {}
+    for name in flow.get("subagents", {}):
+        path = agents_dir / f"{name}.md"
+        outcome = write_subagent(path, flow, name)
+        subagents[name] = _rel(path)
+        (kept if outcome == "kept" else written).append(_rel(path))
     result = {"ok": True, "out": str(out), "agent": _rel(agent_file) if agent_file else None,
-              "written": written, "kept": kept,
+              "subagents": subagents, "written": written, "kept": kept,
               "warnings": [w for w in warnings if "generate creates a stub" not in w]}
     if any((u.get("gate") or {}).get("guard") for _, u in iter_units(flow)):
         result["hook_settings"] = hook_settings(flow, install_path)

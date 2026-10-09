@@ -4,15 +4,16 @@ Build gated, resumable agent workflows ("loops") as Claude Code skills. For exam
 
 > Jira story → requirements **(G1)** → subtasks **(G2)** → per subtask: implement → 2 reviewers in parallel **(G3, reject goes back to implement)** → **(G4)** open PR
 
-You design the flow together with the agent. The builder then generates two things:
+You design the flow together with the agent. The builder then generates:
 
-- a skill, run with `/development-loop PROJ-123`;
-- an **orchestrator agent**, started with `claude --agent development-loop`.
+- **a command**, `/development-loop PROJ-123`, which hands the run straight to the flow's orchestrator agent;
+- **an orchestrator agent**, which only coordinates (described below);
+- **optional custom subagents** for steps that need a specialist, such as an implementer that writes code or a Jira fetcher. Steps without one use the generic `general-purpose` agent.
 
-The orchestrator only coordinates:
+The orchestrator agent works like this:
 
 - **Steps run in subagents.** Each step runs in its own subagent, or in several at once where the flow says so, such as two reviewers with different focuses.
-- **Gates stop for you.** Each gate stops and asks you to approve or reject.
+- **Gates stop for you.** The run stops at each gate and waits for you to approve or reject.
 - **Runs resume.** A small state engine keeps track of where every run is, so an interrupted run resumes where it left off.
 
 ## Layout
@@ -26,8 +27,10 @@ skills/agentic-loop-builder/      # the builder skill: install this one
 
 examples/development-loop/.claude/                # a generated loop with hand-written step skills
   agents/development-loop.md                      # orchestrator agent (generated)
+  agents/development-loop-jira.md                 # custom subagent: fetches the Jira story
+  agents/development-loop-implementer.md          # custom subagent: writes the code
   skills/development-loop/
-    SKILL.md                                      # orchestrator as a skill (generated)
+    SKILL.md                                      # the /development-loop command; forks into the agent (generated)
     flow.json                                     # the flow definition
     state.schema.json                             # JSON Schema of this flow's state.json (generated)
     state_manager.py                              # engine copy (generated)
@@ -83,12 +86,30 @@ mkdir -p <project>/.claude && cp -r examples/development-loop/.claude/. <project
 echo ".agentic-loops/" >> <project>/.gitignore
 ```
 
-Then run it in either of two ways:
+Then run it:
 
-- **Dedicated orchestrator session:** `claude --agent development-loop`, then type the story key, e.g. `PROJ-123`.
-- **From any session:** `/development-loop PROJ-123`.
+```
+/development-loop PROJ-123                                   # runs until the first gate, then reports
+/development-loop PROJ-123 approve G1 looks good             # records your decision, runs to the next gate
+/development-loop PROJ-123 reject G3 handle the empty list   # sends the subtask back to implement
+```
 
-The agent's tools are `Agent(general-purpose)`, Bash (for the engine), Read, Glob, Grep and AskUserQuestion, with no editing tools, so every step really is done by subagents. Run it as the main session rather than delegating to it, because only the main session can stop and ask you at gates. G4 is also enforced by a `PreToolUse` hook that blocks `gh pr create` until G4 is approved; the snippet for `.claude/settings.json` is at the end of the generated `SKILL.md`.
+**How the command works:**
+
+- **It runs the agent.** The command uses `context: fork` with `agent: development-loop`, so each invocation runs the orchestrator agent. The agent advances the run until the next gate, then hands you a report with the files to review and the exact commands to type next.
+- **Only you decide gates.** The command has `disable-model-invocation: true`, so only you can run it, and Claude can't record a gate decision for you.
+- **Interactive alternative:** run `claude --agent development-loop` and give it the story key. The agent then asks at each gate in the conversation.
+
+**The agent's tools:**
+
+- `Agent(development-loop-jira, general-purpose, development-loop-implementer)`, Bash for the engine, Read, Glob, Grep and AskUserQuestion. It has no editing tools, so every step really is done by subagents.
+- G4 is also enforced by a `PreToolUse` hook that blocks `gh pr create` until G4 is approved. The snippet for `.claude/settings.json` is at the end of the agent file.
+
+**Custom subagents.** The flow defines them in `flow.json` under `subagents`, and steps pick one with `subagent_type`:
+
+- **Where they're written:** each becomes `.claude/agents/<name>.md`.
+- **What regeneration does:** the frontmatter (description, tools, model, …) is re-synced from `flow.json`, and the prompt body you wrote is kept.
+- **In the example:** `development-loop-jira` runs on `haiku` and can't edit code; `development-loop-implementer` has write tools. Requirements, decomposition, the reviewers and the PR step use the generic `general-purpose` agent.
 
 ### Engine CLI
 
@@ -113,7 +134,17 @@ python3 skills/agentic-loop-builder/scaffold.py validate my-loop/flow.json
 python3 skills/agentic-loop-builder/scaffold.py generate .claude/skills/my-loop/flow.json --out .claude/skills/my-loop
 ```
 
-`generate` also writes `.claude/agents/my-loop.md`; change that with `--agent-path` or `--no-agent`. It always refreshes `state_manager.py` and `state.schema.json`. It keeps an existing `SKILL.md` and agent file unless you pass `--force`, and it never overwrites `steps/*.md`.
+Besides the skill directory, `generate` also writes:
+
+- `.claude/agents/my-loop.md`, the orchestrator agent. Change its location with `--agent-path`. With `--no-agent`, the command orchestrates inline instead of forking.
+- one `.claude/agents/<name>.md` per custom subagent.
+
+On regeneration:
+
+- `state_manager.py` and `state.schema.json` are always refreshed;
+- an existing `SKILL.md` and orchestrator agent are kept unless you pass `--force`;
+- custom subagents get their frontmatter synced, and their prompts are kept;
+- `steps/*.md` are never overwritten.
 
 ## Notes
 

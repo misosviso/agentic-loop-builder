@@ -31,13 +31,12 @@ class TestGenerate(unittest.TestCase):
         self.assertIn("hook_settings", res)
         self.assertTrue(self.agent.is_file())
         self.assertEqual(Path(res["agent"]).resolve(), self.agent.resolve())
-        skill = (self.out / "SKILL.md").read_text()
-        self.assertTrue(skill.startswith('---\nname: development-loop\ndescription: "Take a Jira story'))
-        self.assertIn("2 in parallel: `correctness`, `verification`", skill)
-        self.assertIn("claude --agent development-loop", skill)
-        self.assertIn("python3 .claude/skills/development-loop/state_manager.py --run <RUN_ID>", skill)
-        self.assertIn("**G4** before, hook-enforced", skill)
-        self.assertIn("init --input story=<Jira issue key, e.g. PROJ-123>", skill)
+        orchestrator = self.agent.read_text()
+        self.assertIn("2 in parallel: `correctness` (general-purpose), `verification` (general-purpose)", orchestrator)
+        self.assertIn("| `development-loop-implementer` |", orchestrator)
+        self.assertIn("python3 .claude/skills/development-loop/state_manager.py --run <RUN_ID>", orchestrator)
+        self.assertIn("**G4** before, hook-enforced", orchestrator)
+        self.assertIn("init --input story=<Jira issue key, e.g. PROJ-123>", orchestrator)
         # the copied engine runs against the copied flow with no --flow argument
         self.assertEqual(sm.simulate(self.out / "flow.json")[-1], "done")
 
@@ -72,11 +71,16 @@ class TestGenerate(unittest.TestCase):
         front, body = text.split("\n---\n", 1)
         fields = dict(line.split(": ", 1) for line in front.splitlines()[1:])
         self.assertEqual(fields["name"], "development-loop")
-        self.assertEqual(fields["tools"], "Agent(general-purpose), Bash, Read, Glob, Grep, AskUserQuestion")
+        self.assertEqual(fields["tools"], "Agent(development-loop-jira, general-purpose, development-loop-implementer), "
+                                          "Bash, Read, Glob, Grep, AskUserQuestion")
         self.assertEqual((fields["model"], fields["color"]), ("inherit", "blue"))
-        self.assertIn("claude --agent development-loop", json.loads(fields["description"]))
-        self.assertIn("Start or resume", json.loads(fields["initialPrompt"]))
+        self.assertLessEqual(len(json.loads(fields["description"])), scaffold.MAX_DESCRIPTION)
+        self.assertIn("Started by /development-loop", json.loads(fields["description"]))
+        self.assertIn("Session mode", json.loads(fields["initialPrompt"]))
         self.assertIn("orchestrator **only**", body)
+        self.assertIn("### Command mode", body)
+        self.assertIn("/development-loop <RUN_ID> reject <GATE> <what must change>", body)
+        self.assertIn("Never approve or reject a gate that the arguments didn't decide.", body)
         self.assertIn("all of them in parallel", body)
         self.assertNotIn("do the step yourself", body)
         self.assertIn("](../skills/development-loop/steps/review.md)", body)
@@ -89,7 +93,25 @@ class TestGenerate(unittest.TestCase):
         other = Path(self.tmp.name) / "plain"
         res = scaffold.generate(EXAMPLE / "flow.json", other, with_agent=False)
         self.assertIsNone(res["agent"])
-        self.assertFalse((other / "agents").exists())
+        self.assertFalse((other / "agents" / "development-loop.md").exists())
+        self.assertTrue((other / "agents" / "development-loop-jira.md").exists())
+        # without an agent the command orchestrates inline instead of forking
+        skill = (other / "SKILL.md").read_text()
+        self.assertNotIn("context: fork", skill)
+        self.assertIn("If `run_in_subagent` is false, do the step yourself", skill)
+        self.assertIn("## Procedure", skill)
+
+    def test_command_forks_into_the_agent(self):
+        scaffold.generate(EXAMPLE / "flow.json", self.out)
+        skill = (self.out / "SKILL.md").read_text()
+        front, body = skill.split("\n---\n", 1)
+        fields = dict(line.split(": ", 1) for line in front.splitlines()[1:])
+        self.assertEqual((fields["context"], fields["agent"]), ("fork", "development-loop"))
+        self.assertEqual((fields["background"], fields["disable-model-invocation"]), ("false", "true"))
+        self.assertLessEqual(len(json.loads(fields["description"])), scaffold.MAX_DESCRIPTION)
+        self.assertIn("$ARGUMENTS", body)
+        self.assertIn("command mode", body)
+        self.assertLess(len(body), 800)  # the procedure lives in the agent, not here
 
     def test_subagent_types_and_agent_skill_stubs(self):
         flow = json.loads((EXAMPLE / "flow.json").read_text())
@@ -97,11 +119,55 @@ class TestGenerate(unittest.TestCase):
         path = Path(self.tmp.name) / "flow.json"
         path.write_text(json.dumps(flow))
         scaffold.generate(path, self.out)
-        self.assertIn("tools: Agent(general-purpose, test-runner),", self.agent.read_text())
+        self.assertIn("tools: Agent(development-loop-jira, general-purpose, development-loop-implementer, test-runner),",
+                      self.agent.read_text())
+        self.assertIn("`verification` (test-runner)", self.agent.read_text())
         stub = (self.out / "steps/review-tests.md").read_text()
         self.assertIn("# Step: review (verification)", stub)
         self.assertIn("`subtasks/{item}/review-verification.md`", stub)
         self.assertIn("used by: `verification`", stub)
+
+    def test_custom_subagents(self):
+        res = scaffold.generate(EXAMPLE / "flow.json", self.out)
+        agents_dir = self.agent.parent
+        impl = agents_dir / "development-loop-implementer.md"
+        self.assertEqual(set(res["subagents"]), {"development-loop-jira", "development-loop-implementer"})
+        front, body = impl.read_text().split("\n---\n", 1)
+        self.assertIn("name: development-loop-implementer", front)
+        self.assertIn("tools: Read, Write, Edit, Glob, Grep, Bash", front)
+        self.assertIn("launches you for these steps: `implement`", body)
+        self.assertIn("## Role", body)
+        jira = (agents_dir / "development-loop-jira.md").read_text()
+        self.assertIn("model: haiku", jira)
+        self.assertIn("disallowedTools: Edit, NotebookEdit, Agent", jira)
+
+        # the prompt body is the user's; frontmatter follows flow.json
+        impl.write_text(front + "\n---\nMy own prompt.\n")
+        flow = json.loads((EXAMPLE / "flow.json").read_text())
+        flow["subagents"]["development-loop-implementer"]["model"] = "opus"
+        path = Path(self.tmp.name) / "flow.json"
+        path.write_text(json.dumps(flow))
+        res = scaffold.generate(path, self.out)
+        text = impl.read_text()
+        self.assertIn("model: opus", text)
+        self.assertTrue(text.endswith("\n---\nMy own prompt.\n"))
+        self.assertIn(scaffold._rel(impl), res["written"])
+        res = scaffold.generate(path, self.out)
+        self.assertIn(scaffold._rel(impl), res["kept"])
+
+    def test_validate_warnings(self):
+        flow = json.loads((EXAMPLE / "flow.json").read_text())
+        flow["description"] = "x" * 250
+        flow["steps"][1]["subagent_type"] = "my-existing-agent"
+        flow["subagents"]["unused-helper"] = {"description": "helps"}
+        path = Path(self.tmp.name) / "flow.json"
+        path.write_text(json.dumps(flow))
+        _, warnings = scaffold.validate(path)
+        text = "\n".join(warnings)
+        self.assertIn("250 characters", text)
+        self.assertIn("'my-existing-agent' is not defined in 'subagents'", text)
+        self.assertIn("'unused-helper' is defined but no step uses it", text)
+        self.assertNotIn("general-purpose", text)
 
     def test_invalid_flow_is_refused(self):
         bad = Path(self.tmp.name) / "flow.json"
@@ -134,9 +200,12 @@ class TestExampleIsInSync(unittest.TestCase):
         self.assertEqual(json.loads((EXAMPLE / "state.schema.json").read_text()), scaffold.state_schema(flow))
         self.assertEqual((EXAMPLE / "SKILL.md").read_text(), scaffold.skill_md(flow, ".claude/skills/development-loop"))
         self.assertEqual(EXAMPLE_AGENT.read_text(), scaffold.agent_md(flow, ".claude/skills/development-loop"))
+        for name, spec in flow["subagents"].items():
+            text = (EXAMPLE_ROOT / "agents" / f"{name}.md").read_text()
+            self.assertTrue(text.startswith(scaffold.subagent_frontmatter(name, spec)), name)
 
     def test_step_skills_are_written(self):
-        for path in (EXAMPLE / "steps").glob("*.md"):
+        for path in [*(EXAMPLE / "steps").glob("*.md"), *(EXAMPLE_ROOT / "agents").glob("*.md")]:
             self.assertNotIn("TODO", path.read_text(), path.name)
 
 

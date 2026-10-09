@@ -121,6 +121,7 @@ def validate_flow(flow: Any) -> list[str]:
     orch = flow.get("orchestrator", {})
     if not isinstance(orch, dict) or not all(isinstance(v, str) for v in orch.values()):
         errors.append("'orchestrator' must map agent settings (e.g. model, color) to strings")
+    _check_subagents(flow, errors)
 
     steps = flow.get("steps")
     if not isinstance(steps, list) or not steps:
@@ -205,6 +206,37 @@ def _check_options(obj: dict, where: str, errors: list[str]) -> None:
         errors.append(f"{where}: 'run_in_subagent' must be true or false")
     if "subagent_type" in obj and (not isinstance(obj["subagent_type"], str) or not obj["subagent_type"]):
         errors.append(f"{where}: 'subagent_type' must be an agent name, e.g. 'general-purpose'")
+
+
+# Frontmatter fields a flow may set on a custom subagent it defines.
+SUBAGENT_FIELDS = {
+    "description": str, "tools": (str, list), "disallowedTools": (str, list), "model": str, "color": str,
+    "effort": str, "maxTurns": int, "permissionMode": str, "isolation": str, "skills": list, "mcpServers": list,
+}
+
+
+def _check_subagents(flow: dict, errors: list[str]) -> None:
+    subagents = flow.get("subagents", {})
+    if not isinstance(subagents, dict):
+        errors.append("'subagents' must map agent names to their settings")
+        return
+    for name, spec in subagents.items():
+        where = f"subagent '{name}'"
+        if not FLOW_NAME_RE.match(name):
+            errors.append(f"{where}: name must be kebab-case, e.g. 'development-loop-implementer'")
+        if name == flow.get("name"):
+            errors.append(f"{where}: the flow's own name is reserved for its orchestrator agent")
+        if not isinstance(spec, dict):
+            errors.append(f"{where}: settings must be an object")
+            continue
+        if not isinstance(spec.get("description"), str) or not spec["description"].strip():
+            errors.append(f"{where}: 'description' is required (when Claude should use this agent)")
+        for key, value in spec.items():
+            if key not in SUBAGENT_FIELDS:
+                errors.append(f"{where}: unknown field '{key}' (allowed: {', '.join(sorted(SUBAGENT_FIELDS))})")
+            elif not isinstance(value, SUBAGENT_FIELDS[key]) or isinstance(value, bool) or (
+                    isinstance(value, list) and key != "mcpServers" and not all(isinstance(v, str) for v in value)):
+                errors.append(f"{where}: '{key}' has the wrong type")
 
 
 def _valid_artifacts(arts: Any) -> bool:
