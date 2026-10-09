@@ -92,6 +92,11 @@ class TestValidateFlow(unittest.TestCase):
             (lambda f: f["steps"][3]["cycle"][1]["agents"].append({"id": "correctness"}), "agent 'correctness': duplicate id"),
             (lambda f: f["steps"][3]["cycle"][1].update(agents=[]), "non-empty list of parallel subagents"),
             (lambda f: f.update(orchestrator={"model": 5}), "'orchestrator' must map"),
+            (lambda f: f["subagents"].update({"Bad_Name": {"description": "x"}}), "must be kebab-case"),
+            (lambda f: f["subagents"].update({"development-loop": {"description": "x"}}), "reserved for its orchestrator"),
+            (lambda f: f["subagents"]["development-loop-jira"].pop("description"), "'description' is required"),
+            (lambda f: f["subagents"]["development-loop-jira"].update(tool=["Read"]), "unknown field 'tool'"),
+            (lambda f: f["subagents"]["development-loop-jira"].update(maxTurns="ten"), "'maxTurns' has the wrong type"),
         ]
         for mutate, expected in cases:
             flow = self.base()
@@ -478,8 +483,9 @@ class TestAgentOptions(EngineTestCase):
         skill="steps/review-tests.md", subagent_type="test-runner", artifacts=["subtasks/{item}/tests.md"])
 
     def test_own_skill_type_and_artifacts(self):
+        self.assertEqual(self.run.next_action()["subagent_type"], "development-loop-jira")
         self.to_subtasks()
-        self.assertEqual(self.run.next_action()["subagent_type"], "worker")
+        self.assertEqual(self.run.next_action()["subagent_type"], "development-loop-implementer")
         self.do_step("subtasks[T1].implement")
         corr, ver = self.run.next_action()["agents"]
         self.assertEqual((corr["subagent_type"], ver["subagent_type"]), ("worker", "test-runner"))

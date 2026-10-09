@@ -1,6 +1,6 @@
 {
   "name": "development-loop",
-  "description": "Take a Jira story from context to pull request: requirements, decomposition into subtasks, an implement/review cycle per subtask, then a PR. Use when the user asks to develop, implement or deliver a Jira story end to end.",
+  "description": "Develop a Jira story end to end: requirements, subtasks, implement and review, then a pull request.",
   "inputs": {
     "story": "Jira issue key, e.g. PROJ-123"
   },
@@ -11,6 +11,28 @@
   "orchestrator": {
     "model": "inherit",
     "color": "blue"
+  },
+  "subagents": {
+    "development-loop-jira": {
+      "description": "Fetches a Jira issue with its links and discussion into a Markdown file. Read-only towards Jira and the code.",
+      "model": "haiku",
+      "disallowedTools": [
+        "Edit",
+        "NotebookEdit",
+        "Agent"
+      ]
+    },
+    "development-loop-implementer": {
+      "description": "Implements one well-specified coding subtask with tests, verifies it and commits it. Never pushes.",
+      "tools": [
+        "Read",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Bash"
+      ]
+    }
   },
   "item_schemas": {
     "subtask": {
@@ -72,6 +94,7 @@
       "id": "jira_context",
       "kind": "single",
       "skill": "steps/jira-context.md",
+      "subagent_type": "development-loop-jira",
       "artifacts": [
         "jira-context.md"
       ]
@@ -130,6 +153,7 @@
         {
           "id": "implement",
           "skill": "steps/implement.md",
+          "subagent_type": "development-loop-implementer",
           "artifacts": [
             "subtasks/{item}/implementation.md"
           ]
