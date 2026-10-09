@@ -1,12 +1,15 @@
 ---
 name: agentic-loop-builder
-description: Design and generate a gated, resumable agentic workflow (a "loop") as a skill. It produces a flow.json, a state engine, an orchestrator SKILL.md, and one skill per step that runs in a subagent. Use when the user wants to build, scaffold or change a multi-step agent flow with approval gates, such as Jira to requirements to subtasks to implement/review to PR.
+description: Design and generate a gated, resumable agentic workflow (a "loop") as a skill plus an orchestrator agent. It produces a flow.json, a state engine, an orchestrator SKILL.md and agent, and one skill per step that runs in a subagent (or several in parallel). Use when the user wants to build, scaffold or change a multi-step agent flow with approval gates, such as Jira to requirements to subtasks to implement/review to PR.
 argument-hint: "[loop-name] [short description]"
 ---
 
 # Agentic Loop Builder
 
-You help the user design a **loop**: a multi-step workflow with approval gates. You then generate it as a skill they can run with `/<loop-name> <run-id>`.
+You help the user design a **loop**: a multi-step workflow with approval gates. You then generate it in two forms:
+
+- a skill they can run with `/<loop-name> <run-id>`;
+- an **orchestrator agent** they can start with `claude --agent <loop-name>`. It only coordinates: it launches subagents for the steps (several in parallel where the flow says so) and stops at every gate.
 
 A generated loop has three separated parts:
 
@@ -31,7 +34,8 @@ The tools live next to this file:
   "name": "development-loop",            // kebab-case; becomes /development-loop
   "description": "…when to use it…",     // the orchestrator skill's description
   "inputs": { "story": "Jira key" },     // required at `init --input story=…`
-  "defaults": { "run_in_subagent": true, "max_iterations": 3 },
+  "defaults": { "run_in_subagent": true, "max_iterations": 3, "subagent_type": "general-purpose" },
+  "orchestrator": { "model": "inherit", "color": "blue" },   // frontmatter of the generated agent
   "item_schemas": { "subtask": { /* JSON Schema subset */ } },
   "steps": [
     { "id": "requirements", "kind": "single",
@@ -48,7 +52,12 @@ The tools live next to this file:
       "max_iterations": 3,                        // rounds per item before it fails to the user
       "cycle": [
         { "id": "implement", "skill": "…", "artifacts": ["subtasks/{item}/implementation.md"] },
-        { "id": "review", "skill": "…", "artifacts": ["subtasks/{item}/review.md"],
+        { "id": "review", "skill": "steps/review.md",
+          "agents": [                             // parallel subagents for this one step
+            { "id": "correctness", "focus": "bugs, edge cases, security" },
+            { "id": "verification", "focus": "re-run checks, judge the tests",
+              "skill": "steps/review-tests.md", "subagent_type": "test-runner" } ],
+          "artifacts": ["subtasks/{item}/review-{agent}.md"],   // {agent} -> the agent id
           "gate": { "id": "G3", "on_reject": "implement" } } ] },
     { "id": "open_pr", "kind": "single", "skill": "…", "needs": ["subtasks"],
       "gate": { "id": "G4", "when": "before",
@@ -67,6 +76,9 @@ Semantics, which you should explain to the user as they become relevant:
 - **`foreach` over `produces_items`.** The producing step's file is validated against `item_schema`, its `depends_on` ids are checked and cycle-checked, and the file is expanded into one cycle per item. `{item}` in artifact names becomes the item id.
 - **`guard`.** A `PreToolUse` hook blocks matching tool calls unless the gated step is the run's current step. This makes the gate hard rather than prompt-only.
 - **`run_in_subagent`** (default true). The orchestrator spawns one subagent per step, so the main context stays small.
+- **`agents`** (parallel subagents). The step launches every listed agent at once. Each gets the step's inputs plus its own `focus`, its own outputs (an `agents[].artifacts` list, or the step's `artifacts` with `{agent}` replaced) and, optionally, its own `skill` and `subagent_type`. The engine waits for every agent to report, then the step completes, so the gate sees all their outputs side by side. If one agent fails, `retry` reruns only the agents that didn't finish. Typical uses are several reviewers with different lenses, independent research angles, or an implementation compared against a second opinion. Parallel agents share the working tree, so give them read-only work or disjoint output files.
+- **`subagent_type`** (default `general-purpose`). Which Claude Code agent runs the step, e.g. a custom read-only reviewer from `.claude/agents/`. It can be set per step or per parallel agent. The orchestrator agent may only launch the types the flow uses.
+- **`orchestrator`**: `model`, `color` and `effort` for the generated orchestrator agent.
 
 ## Process
 
@@ -80,6 +92,7 @@ Ask the user to describe the workflow in plain words: what goes in, what comes o
 - **Steps.** For each step: what it produces, as files, and what it needs from earlier steps.
 - **Repetition.** Does anything repeat per item (subtasks, files, services)? What decides the items, and do they depend on each other?
 - **Loops.** Which review sends work back, and to which step? How many rounds before a human steps in?
+- **Parallelism.** Would any step benefit from several subagents working at once, such as two reviewers with different focuses? What does each one own, and which file does each write?
 - **Gates.** Which outputs does the human approve (`after`)? Which actions need approval before they happen (`before`), such as pushing, deploying, sending or deleting? Which of those must be hard-blocked by a hook?
 - **Tools and access** each step needs, such as the Jira MCP, `gh`, or read-only access.
 
@@ -87,7 +100,7 @@ Ask the user to describe the workflow in plain words: what goes in, what comes o
 
 Present a table and iterate until the user agrees:
 
-| # | Step id | Kind | Needs | Artifacts | Gate | On reject | Subagent |
+| # | Step id | Kind | Needs | Artifacts | Gate | On reject | Subagents (type, parallel agents) |
 |---|---|---|---|---|---|---|---|
 
 Call out anything risky:
@@ -95,7 +108,8 @@ Call out anything risky:
 - an irreversible action without a `before` gate;
 - a loop without a gate or a cap;
 - a foreach whose items have no verification points;
-- a step that produces nothing a later step reads.
+- a step that produces nothing a later step reads;
+- parallel agents that would edit the same files.
 
 ### 3. Write and validate `flow.json`
 
@@ -114,7 +128,16 @@ Show the user the simulation trace: it's the exact order of steps and gates thei
 python3 BUILDER/scaffold.py generate <loop-dir>/flow.json --out <loop-dir> [--install-path <path from project root>]
 ```
 
-This writes `SKILL.md` (the orchestrator), `state.schema.json`, `state_manager.py`, and stubs for every `steps/*.md`. Existing step files and `SKILL.md` are kept; pass `--force` to regenerate `SKILL.md`.
+This writes:
+
+- `SKILL.md` (the orchestrator as a skill);
+- the orchestrator agent at `.claude/agents/<name>.md` (choose another path with `--agent-path`, or skip it with `--no-agent`);
+- `state.schema.json` and `state_manager.py`;
+- stubs for every `steps/*.md`, including each parallel agent's own skill.
+
+Existing step files, `SKILL.md` and the agent file are kept; pass `--force` to regenerate `SKILL.md` and the agent.
+
+The agent's tools are limited to `Agent(<the subagent types the flow uses>)`, Bash for the engine, Read, Glob, Grep and AskUserQuestion. It has no editing tools, so it cannot do a step's work itself. It must run as the **main session**, not as a delegated subagent, because only the main session can stop and ask the user at gates.
 
 If the output contains `hook_settings`, offer to merge it into `.claude/settings.json`, which turns guarded gates into hard blocks. Show the user the change before writing it. Also suggest adding `.agentic-loops/` to `.gitignore`.
 
@@ -134,7 +157,7 @@ For fully written examples worth borrowing from, see `examples/development-loop/
 
 Tell the user:
 
-- how to run the loop: `/<name> <run-id>`;
+- how to run the loop: `/<name> <run-id>` from any session, or `claude --agent <name>` followed by the run id for a dedicated orchestrator session;
 - where runs live;
 - that re-running the same command resumes a run;
 - that `state_manager.py --run <id> status` shows progress at any time.

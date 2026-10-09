@@ -224,6 +224,13 @@
         },
         "gate": {
           "$ref": "#/$defs/gate"
+        },
+        "agents": {
+          "type": "object",
+          "description": "present on steps that run parallel subagents, keyed by agent id",
+          "additionalProperties": {
+            "$ref": "#/$defs/agent"
+          }
         }
       }
     },
@@ -257,6 +264,53 @@
           "items": {
             "type": "object"
           }
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "required": [
+        "status",
+        "artifacts"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "pending",
+            "running",
+            "done",
+            "failed"
+          ]
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "completed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     }

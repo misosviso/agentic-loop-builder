@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "skills" / "agentic-loop-builder"
-EXAMPLE_FLOW = ROOT / "examples" / "development-loop" / "flow.json"
+EXAMPLE_FLOW = ROOT / "examples" / "development-loop" / ".claude" / "skills" / "development-loop" / "flow.json"
 sys.path.insert(0, str(BUILDER))
 
 import state_manager as sm  # noqa: E402
@@ -53,6 +53,10 @@ class EngineTestCase(unittest.TestCase):
         for out in act["outputs"]:
             rel = Path(out).relative_to(self.run.artifacts_dir).as_posix()
             self.write(rel, (files or {}).get(rel, "content"))
+        if act.get("agents"):
+            for agent in act["agents"]:
+                res = self.run.complete(expected_step, summary=f"{agent['agent']} ok", agent=agent["agent"])
+            return res
         return self.run.complete(expected_step, summary=f"did {expected_step}")
 
     def to_subtasks(self):
@@ -81,6 +85,13 @@ class TestValidateFlow(unittest.TestCase):
             (lambda f: f["steps"][2]["produces_items"].update(item_schema="missing"), "not defined in 'item_schemas'"),
             (lambda f: f["steps"][0].update(kind="parallel"), "unknown kind"),
             (lambda f: f["steps"][4].update(id="Open-PR"), "snake_case"),
+            (lambda f: f["steps"][3]["cycle"][1].update(artifacts=["subtasks/{item}/review.md"]), "would write the same file"),
+            (lambda f: f["steps"][1].update(artifacts=["req-{agent}.md"]), "needs an 'agents' list"),
+            (lambda f: f["steps"][3]["cycle"][1].update(run_in_subagent=False), "always run as subagents"),
+            (lambda f: f["steps"][2].update(agents=[{"id": "a"}]), "cannot produce items"),
+            (lambda f: f["steps"][3]["cycle"][1]["agents"].append({"id": "correctness"}), "agent 'correctness': duplicate id"),
+            (lambda f: f["steps"][3]["cycle"][1].update(agents=[]), "non-empty list of parallel subagents"),
+            (lambda f: f.update(orchestrator={"model": 5}), "'orchestrator' must map"),
         ]
         for mutate, expected in cases:
             flow = self.base()
@@ -170,6 +181,7 @@ class TestHappyPath(EngineTestCase):
         self.do_step("subtasks[T1].implement")
         act = self.run.next_action()
         self.assertIn(str(self.run.artifacts_dir / "subtasks/T1/implementation.md"), act["inputs"])
+        self.assertEqual([a["agent"] for a in act["agents"]], ["correctness", "verification"])
         self.do_step("subtasks[T1].review")
         self.run.approve("G3")
         self.do_step("subtasks[T2].implement")
@@ -298,12 +310,14 @@ class TestRejections(EngineTestCase):
         act = res["next"]
         self.assertEqual((act["step"], act["attempt"]), ("subtasks[T1].implement", 2))
         self.assertEqual(act["feedback"], "Gate G3 rejected: handle empty input")
-        # the review that sent it back is offered as input
-        self.assertIn(str(self.run.artifacts_dir / "subtasks/T1/review.md"), act["inputs"])
+        # the reviews that sent it back are offered as input
+        self.assertIn(str(self.run.artifacts_dir / "subtasks/T1/review-correctness.md"), act["inputs"])
+        self.assertIn(str(self.run.artifacts_dir / "subtasks/T1/review-verification.md"), act["inputs"])
         item = self.run.state["steps"]["subtasks"]["items"][1]
         self.assertEqual(item["id"], "T1")
         self.assertEqual(item["steps"]["review"]["status"], "pending")
         self.assertEqual(item["steps"]["review"]["gate"]["status"], "pending")
+        self.assertEqual({a["status"] for a in item["steps"]["review"]["agents"].values()}, {"pending"})
         self.do_step("subtasks[T1].implement")
         self.do_step("subtasks[T1].review")
         self.run.approve("G3")
@@ -359,6 +373,121 @@ class TestRejectToEarlierStep(EngineTestCase):
         self.do_step("decomposition", {"subtasks.json": SUBTASKS})
 
 
+class TestParallelAgents(EngineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.to_subtasks()
+        self.do_step("subtasks[T1].implement")
+        self.path = "subtasks[T1].review"
+
+    def write_reviews(self, *agents):
+        for a in agents:
+            self.write(f"subtasks/T1/review-{a}.md", f"{a} review")
+
+    def test_run_step_lists_each_agent(self):
+        act = self.run.next_action()
+        self.assertTrue(act["run_in_subagent"])
+        self.assertEqual(act["outputs"], [str(self.run.artifacts_dir / f"subtasks/T1/review-{a}.md") for a in ("correctness", "verification")])
+        corr, ver = act["agents"]
+        self.assertEqual(corr["agent"], "correctness")
+        self.assertTrue(corr["skill"].endswith("steps/review.md"))
+        self.assertIn("Correctness", corr["focus"])
+        self.assertEqual(corr["subagent_type"], "general-purpose")
+        self.assertEqual(ver["outputs"], [str(self.run.artifacts_dir / "subtasks/T1/review-verification.md")])
+        self.assertIn("--agent verification", ver["commands"]["complete"])
+        self.assertNotIn("complete", act["commands"])
+        self.assertEqual(self.run.start(self.path)["agents"], ["correctness", "verification"])
+
+    def test_step_completes_when_all_agents_report(self):
+        self.run.start(self.path)
+        self.write_reviews("correctness", "verification")
+        with self.assertRaises(sm.EngineError) as cm:
+            self.run.complete(self.path)
+        self.assertIn("report each with --agent", str(cm.exception))
+        res = self.run.complete(self.path, summary="2 nits", agent="correctness")
+        self.assertEqual((res["status"], res["waiting_for"]), ("running", ["verification"]))
+        with self.assertRaises(sm.EngineError):
+            self.run.complete(self.path, agent="correctness")  # already reported
+        res = self.run.complete(self.path, summary="all green", agent="verification")
+        self.assertEqual(res["status"], "awaiting_gate")
+        gate = res["next"]
+        self.assertEqual(gate["gate"], "G3")
+        self.assertEqual(len(gate["review"]), 2)
+        self.assertEqual(gate["summary"], "correctness: 2 nits | verification: all green")
+
+    def test_agent_artifacts_are_checked_per_agent(self):
+        self.run.start(self.path)
+        self.write_reviews("verification")
+        with self.assertRaises(sm.EngineError) as cm:
+            self.run.complete(self.path, agent="correctness")
+        self.assertIn("review-correctness.md", str(cm.exception))
+        self.run.complete(self.path, agent="verification")
+
+    def test_failed_agent_fails_step_and_retry_reruns_only_it(self):
+        self.run.start(self.path)
+        self.write_reviews("correctness")
+        self.run.complete(self.path, agent="correctness")
+        res = self.run.fail(self.path, "test env broken", agent="verification")
+        self.assertEqual(res["next"]["action"], "failed")
+        self.assertIn("agent 'verification' failed: test env broken", res["next"]["reason"])
+        act = self.run.retry(self.path)["next"]
+        self.assertEqual([a["agent"] for a in act["agents"]], ["verification"])
+        self.assertEqual(self.run.start(self.path)["agents"], ["verification"])
+        self.write_reviews("verification")
+        res = self.run.complete(self.path, agent="verification")
+        self.assertEqual(res["status"], "awaiting_gate")
+        self.assertEqual(len(res["next"]["review"]), 2)
+
+    def test_failing_agent_waits_for_running_siblings(self):
+        self.run.start(self.path)
+        res = self.run.fail(self.path, "crashed", agent="correctness")
+        self.assertEqual((res["status"], res["waiting_for"]), ("running", ["verification"]))
+        self.write_reviews("verification")
+        res = self.run.complete(self.path, agent="verification")
+        self.assertEqual(res["status"], "failed")
+
+    def test_resume_lists_only_unfinished_agents(self):
+        self.run.start(self.path)
+        self.write_reviews("correctness")
+        self.run.complete(self.path, agent="correctness")
+        self.reload()
+        act = self.run.next_action()
+        self.assertTrue(act["resumed"])
+        self.assertEqual([a["agent"] for a in act["agents"]], ["verification"])
+
+    def test_agent_flag_refused_on_single_step(self):
+        self.assertEqual(self.run.next_action()["step"], self.path)
+        self.do_step(self.path)
+        self.run.approve("G3")
+        self.run.start("subtasks[T2].implement")
+        with self.assertRaises(sm.EngineError) as cm:
+            self.run.complete("subtasks[T2].implement", agent="x")
+        self.assertIn("no parallel agents", str(cm.exception))
+
+    def test_status_shows_agents(self):
+        self.run.start(self.path)
+        self.write_reviews("correctness")
+        self.run.complete(self.path, agent="correctness")
+        self.assertIn("agents: correctness done, verification running", self.run.render_status())
+
+
+class TestAgentOptions(EngineTestCase):
+    flow_dict = copy.deepcopy(json.loads(EXAMPLE_FLOW.read_text()))
+    flow_dict["defaults"]["subagent_type"] = "worker"
+    flow_dict["steps"][3]["cycle"][1]["agents"][1].update(
+        skill="steps/review-tests.md", subagent_type="test-runner", artifacts=["subtasks/{item}/tests.md"])
+
+    def test_own_skill_type_and_artifacts(self):
+        self.to_subtasks()
+        self.assertEqual(self.run.next_action()["subagent_type"], "worker")
+        self.do_step("subtasks[T1].implement")
+        corr, ver = self.run.next_action()["agents"]
+        self.assertEqual((corr["subagent_type"], ver["subagent_type"]), ("worker", "test-runner"))
+        self.assertTrue(ver["skill"].endswith("steps/review-tests.md"))
+        self.assertEqual(ver["outputs"], [str(self.run.artifacts_dir / "subtasks/T1/tests.md")])
+        self.assertEqual(corr["outputs"], [str(self.run.artifacts_dir / "subtasks/T1/review-correctness.md")])
+
+
 class TestIndependentItems(EngineTestCase):
     flow_dict = copy.deepcopy(json.loads(EXAMPLE_FLOW.read_text()))
     flow_dict["steps"][3]["respect_item_dependencies"] = False
@@ -374,6 +503,7 @@ class TestSimulateAndGuard(unittest.TestCase):
         self.assertEqual(trace[-1], "done")
         self.assertIn("gate  G3 (after subtasks[T1].review) REJECTED -> back to subtasks[T1].implement", trace)
         self.assertIn("run   subtasks[T1].implement  [attempt 2, subagent] (with feedback)", trace)
+        self.assertIn("run   subtasks[T1].review  [attempt 1, 2 parallel subagents: correctness, verification]", trace)
         self.assertLess(trace.index("gate  G4 (before open_pr) approved"), trace.index("run   open_pr  [attempt 1, subagent]"))
 
     def test_simulate_reports_max_iterations(self):
@@ -397,7 +527,8 @@ class TestSimulateAndGuard(unittest.TestCase):
                         content = json.dumps(SUBTASKS) if out == act.get("items_file") else "x"
                         Path(out).parent.mkdir(parents=True, exist_ok=True)
                         Path(out).write_text(content)
-                    run.complete(act["step"])
+                    for agent in act.get("agents") or [None]:
+                        run.complete(act["step"], agent=agent and agent["agent"])
                 else:
                     run.approve(act["gate"])
             run.save()
@@ -455,6 +586,23 @@ class TestCli(unittest.TestCase):
         code, out, _ = self.cli("approve", "G1")
         self.assertEqual(code, 1)
         self.assertIn("no gate is waiting", json.loads(out)["error"])
+
+    def test_cli_parallel_agents(self):
+        flow = json.loads(EXAMPLE_FLOW.read_text())
+        flow["steps"] = [{"id": "review", "skill": "r.md", "artifacts": ["review-{agent}.md"],
+                          "agents": [{"id": "a"}, {"id": "b"}]}]
+        flow_path = Path(self.tmp.name) / "flow.json"
+        flow_path.write_text(json.dumps(flow))
+        self.base[3] = str(flow_path)
+        self.cli("init", "--input", "story=PROJ-7")
+        self.cli("start", "review")
+        arts = Path(self.tmp.name) / "development-loop" / "PROJ-7" / "artifacts"
+        (arts / "review-a.md").write_text("a")
+        (arts / "review-b.md").write_text("b")
+        code, out, _ = self.cli("complete", "review", "--agent", "a", "--summary", "ok")
+        self.assertEqual(json.loads(out)["waiting_for"], ["b"])
+        code, out, _ = self.cli("complete", "review", "--agent", "b")
+        self.assertEqual(json.loads(out)["next"]["action"], "done")
 
     def test_cli_guard_exit_codes(self):
         hook = json.dumps({"tool_name": "Bash", "tool_input": {"command": "gh pr create"}})
