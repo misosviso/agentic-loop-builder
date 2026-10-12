@@ -13,14 +13,16 @@ Turn the story into precise, testable requirements grounded in the actual codeba
 
 ## Outputs
 
-- `requirements.md`, with these sections:
-  - **Summary**: two or three sentences on what changes for whom, and why.
-  - **Scope**: what is in scope, and explicitly what is out of scope.
-  - **Functional requirements**: numbered `R1`, `R2` and so on. Each is one testable statement in the form "When …, the system …". Under each, list its acceptance checks: concrete inputs and expected outputs or behavior.
-  - **Non-functional requirements**: performance, security, compatibility and observability, but only those that actually apply.
-  - **Codebase findings**: the modules, files, APIs and patterns this will touch or should follow, with paths. Note existing tests near the change.
-  - **Assumptions**: each one marked as something the user should confirm at G1.
-  - **Open questions**: carried over from `jira-context.md` if still unresolved, plus new ones.
+- `requirements.md`, with these headings:
+  - `## Summary`: two or three sentences on what changes for whom, and why.
+  - `## Scope`: what is in scope, and explicitly what is out of scope.
+  - `## Functional requirements`: numbered `R1`, `R2` and so on. Each is one testable statement in the form "When …, the system …". Under each, list its acceptance checks: concrete inputs and expected outputs or behavior.
+  - `## Non-functional requirements`: performance, security, compatibility and observability, but only those that actually apply.
+  - `## Codebase findings`: the modules, files, APIs and patterns this will touch or should follow, with paths. Note existing tests near the change.
+  - `## Assumptions`: each one marked as something the user should confirm at G1. Write "none" if there are none.
+  - `## Open questions`: carried over from `jira-context.md` if still unresolved, plus new ones. Write "none" if there are none.
+
+When you finish, the engine checks for the headings `## Summary`, `## Scope`, `## Functional requirements`, `## Assumptions` and `## Open questions`, and that `R1` exists. It refuses the file if any is missing, so use the headings exactly, each on its own line.
 
 ## Procedure
 

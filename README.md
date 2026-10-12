@@ -2,7 +2,7 @@
 
 Build gated, resumable agent workflows ("loops") as Claude Code skills. For example:
 
-> Jira story → requirements **(G1)** → subtasks **(G2)** → per subtask: implement → 2 reviewers in parallel **(G3, reject goes back to implement)** → **(G4)** open PR
+> Jira story → requirements **(G1)** → subtasks **(G2)** → per subtask: implement → 2 reviewers in parallel, looping back automatically while either says CHANGES_NEEDED → **(G3)** → **(G4)** open PR → wait for CI, fixing and re-waiting if it fails
 
 You design the flow together with the agent. The builder then generates:
 
@@ -16,12 +16,23 @@ The orchestrator agent works like this:
 - **Gates stop for you.** The run stops at each gate and waits for you to approve or reject.
 - **Runs resume.** A small state engine keeps track of where every run is, so an interrupted run resumes where it left off.
 
+The builder is designed so that the generated loop **works on its first run**, in any domain. Generated flows tend to be weaker than hand-written ones for four reasons, and each one is addressed:
+
+| Weakness of a naive generated flow | What the engine and builder do |
+|---|---|
+| Only checks that output files exist | **Contracts** on every artifact (required headings, regexes, a JSON Schema, a minimum size) and **checks**, which are commands that must exit 0. Bad output is refused with the exact problems, and the step fails after a few refusals. |
+| Loops only when a human rejects | **`repeat`/`until`**: a condition on a step's structured output sends the work back automatically, with feedback, up to a cap. **`when`** skips a step whose condition is false. |
+| Can't wait for anything outside the loop | **`wait`** steps poll a command, or a subagent, until something external is ready (CI, a review, a deployment), with an interval, a timeout and a failure route. |
+| Steps lack the tools or access they need | **`requires`** (commands, environment variables, MCP servers, tools), checked by a **preflight** at `init`. **`scaffold.py check`** also verifies that each step's subagent has the tools the step needs, and simulates every branch. |
+
+The builder's interview asks about each of these for every step.
+
 ## Layout
 
 ```
 skills/agentic-loop-builder/      # the builder skill: install this one
   SKILL.md                        # interview: describe → step table → flow.json → generate → write steps
-  scaffold.py                     # flow.json → orchestrator SKILL.md, state.schema.json, step stubs
+  scaffold.py                     # check (readiness report), validate, generate: flow.json → command, agents, stubs
   state_manager.py                # the generic state engine (copied into every generated loop)
   templates/                      # orchestrator + step-stub templates
 
@@ -34,7 +45,8 @@ examples/development-loop/.claude/                # a generated loop with hand-w
     flow.json                                     # the flow definition
     state.schema.json                             # JSON Schema of this flow's state.json (generated)
     state_manager.py                              # engine copy (generated)
-    steps/{jira-context,requirements,decompose,implement,review,open-pr}.md
+    steps/{jira-context,requirements,decompose,implement,review,open-pr,fix-ci}.md
+    scripts/ci_status.sh                          # the CI wait's check: exit 0 ready, 1 failed, else pending
 
 tests/                            # python3 -m unittest discover -s tests
 ```
@@ -57,19 +69,24 @@ The orchestrator, whether the skill or the agent, is thin. It asks the engine `n
  "agents": [{"agent": "correctness",  "focus": "...", "outputs": [".../review-correctness.md"], ...},
             {"agent": "verification", "focus": "...", "outputs": [".../review-verification.md"], ...}]}
 {"action": "await_gate", "gate": "G3", "when": "after", "review": [...], "prompt": "..."}
+{"action": "wait",       "step": "ci", "due": false, "next_check_at": "...", "commands": {"poll_blocking": "..."}}
 {"action": "failed",     "step": "...", "reason": "still rejected after 3 attempt(s) ..."}
 {"action": "done",       "artifacts": [...]}
 ```
 
 The engine owns all the logic:
 
-- the order of steps;
+- the order of steps, and skipping steps whose `when` condition is false;
+- verifying output against its contract and running its checks, refusing it with the exact problems, and failing the step after `max_fix_attempts`;
+- automatic loops (`repeat`): evaluating the condition, sending the work back with feedback and the files behind it, enforcing the round cap and the exhaustion policy (`fail`, `gate` or `continue`);
+- waits: running or scheduling the check, blocking polls, timeouts, and failure routes such as going back to a fix step;
 - `foreach` expansion over items an earlier step produced, validated against an item schema, with dependency ordering and cycle detection;
 - sending rejected work back with feedback, and rerunning what depends on it;
 - `max_iterations` caps;
 - parallel `agents` within a step: all start together, each reports with `complete --agent`, and the step finishes once the last one reports. A failed agent fails the step, and `retry` reruns only the agents that didn't finish;
 - `after` gates (approve an output) and `before` gates (approve an action);
-- atomic writes, a history log and resume.
+- atomic writes, a history log and resume;
+- a preflight of commands, environment variables and MCP servers before a run starts.
 
 ## Use it
 
@@ -86,7 +103,11 @@ mkdir -p <project>/.claude && cp -r examples/development-loop/.claude/. <project
 echo ".agentic-loops/" >> <project>/.gitignore
 ```
 
-Then run it:
+Check that it's ready in this project, then run it:
+
+```
+python3 .claude/skills/agentic-loop-builder/scaffold.py check .claude/skills/development-loop/flow.json
+```
 
 ```
 /development-loop PROJ-123                                   # runs until the first gate, then reports
@@ -99,6 +120,7 @@ Then run it:
 - **It runs the agent.** The command uses `context: fork` with `agent: development-loop`, so each invocation runs the orchestrator agent. The agent advances the run until the next gate, then hands you a report with the files to review and the exact commands to type next.
 - **Only you decide gates.** The command has `disable-model-invocation: true`, so only you can run it, and Claude can't record a gate decision for you.
 - **Interactive alternative:** run `claude --agent development-loop` and give it the story key. The agent then asks at each gate in the conversation.
+- **Waiting on CI:** after the PR, the run waits on CI. Checks due within about ten minutes are polled in place. Otherwise the command stops and tells you when the next check is due; run it again later to continue. If CI fails, `fix_ci` runs with the failing output, pushes a fix, and the wait starts again, up to 3 times.
 
 **The agent's tools:**
 
@@ -122,17 +144,28 @@ $E complete 'subtasks[T1].implement' --summary "added retry policy"
 $E complete 'subtasks[T1].review' --agent correctness --summary "2 nits"   # one per parallel agent
 $E approve G3 --note "nice"
 $E reject G3 --feedback "handle the empty list"
+$E poll ci [--block 590] [--now]          # check a waiting step, optionally waiting up to ~10 min
 $E retry 'subtasks[T1].implement'         # after max_iterations, or after a failed step
 $E status                                 # human-readable progress
-python3 .claude/skills/development-loop/state_manager.py simulate --reject G3   # dry run of the flow
+S="python3 .claude/skills/development-loop/state_manager.py"
+$S preflight                              # are the commands, variables and MCP servers there?
+$S simulate --reject G3 --until review=1 --wait ci=2 --wait-fail ci=1 --skip fix_ci   # dry run of one branch
 ```
 
 ### Scaffolder
 
 ```bash
-python3 skills/agentic-loop-builder/scaffold.py validate my-loop/flow.json
+python3 skills/agentic-loop-builder/scaffold.py check    .claude/skills/my-loop/flow.json   # readiness report
 python3 skills/agentic-loop-builder/scaffold.py generate .claude/skills/my-loop/flow.json --out .claude/skills/my-loop
 ```
+
+`check` prints **READY** or **NOT READY**. Its report covers:
+
+- **Structure:** the flow's structure, with "did you mean" for unknown keys.
+- **Subagents:** whether each step's subagent can write its outputs and has the tools, shell and MCP servers the step requires.
+- **Environment:** the preflight. Skip it with `--no-env`.
+- **Paths:** every branch simulated: each gate rejected once and every time, each loop failing once and never passing, each `when` false, each wait pending and failing. A branch that never ends is an error.
+- **Gaps:** steps whose outputs are only checked for existence.
 
 Besides the skill directory, `generate` also writes:
 

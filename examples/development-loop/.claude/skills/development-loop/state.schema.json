@@ -32,6 +32,10 @@
         }
       }
     },
+    "project_dir": {
+      "type": "string",
+      "description": "where checks and wait commands run"
+    },
     "created_at": {
       "type": "string"
     },
@@ -45,7 +49,9 @@
         "requirements",
         "decomposition",
         "subtasks",
-        "open_pr"
+        "open_pr",
+        "fix_ci",
+        "ci"
       ],
       "properties": {
         "jira_context": {
@@ -76,7 +82,8 @@
               "enum": [
                 "pending",
                 "running",
-                "done"
+                "done",
+                "skipped"
               ]
             },
             "items": {
@@ -144,6 +151,14 @@
         "open_pr": {
           "$ref": "#/$defs/unit",
           "description": "single step; skill steps/open-pr.md"
+        },
+        "fix_ci": {
+          "$ref": "#/$defs/unit",
+          "description": "single step; skill steps/fix-ci.md"
+        },
+        "ci": {
+          "$ref": "#/$defs/unit",
+          "description": "single step; waits on an external check"
         }
       }
     }
@@ -165,8 +180,10 @@
           "enum": [
             "pending",
             "running",
+            "waiting",
             "awaiting_gate",
             "done",
+            "skipped",
             "failed"
           ]
         },
@@ -198,10 +215,57 @@
             "null"
           ]
         },
+        "feedback_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "feedback_history": {
           "type": "array",
           "items": {
             "type": "object"
+          }
+        },
+        "loops": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "automatic loop-backs made by `repeat`"
+        },
+        "fix_failures": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "refused completions this attempt"
+        },
+        "wait": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "started_at": {
+              "type": "string"
+            },
+            "next_check_at": {
+              "type": "string"
+            },
+            "polls": {
+              "type": "integer"
+            },
+            "last_status": {
+              "enum": [
+                "ready",
+                "pending",
+                "failed",
+                null
+              ]
+            },
+            "last_checked_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         },
         "error": {
@@ -311,6 +375,10 @@
             "string",
             "null"
           ]
+        },
+        "fix_failures": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     }

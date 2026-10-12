@@ -15,7 +15,9 @@ Push the feature branch and open one pull request that a reviewer can understand
 ## Outputs
 
 - A pushed branch and an open pull request.
-- `pr.md`: the PR URL, the title, the body exactly as submitted, and the branch name.
+- `pr.md`, with a `## Pull request` heading followed by the PR URL, the title, the branch name, and the body exactly as submitted. The engine refuses the file unless it contains the URL (`…/pull/<number>`).
+
+After this step, the flow waits for CI on the pull request. If CI fails, a fix step runs and pushes to the same branch.
 
 ## Procedure
 

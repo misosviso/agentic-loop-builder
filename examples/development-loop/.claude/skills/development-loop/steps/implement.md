@@ -10,17 +10,19 @@ Implement exactly this subtask so that all of its verification points pass, with
 
 - The work item: this subtask's JSON, with `goal`, `verification`, `depends_on` and `files`.
 - `requirements.md`, `plan.md` and `subtasks.json`, for context. Implement only *this* subtask.
-- On a retry: the previous reviews for this subtask (`review-correctness.md` and `review-verification.md`) and the feedback from gate G3. Every point in them must be addressed.
+- On a retry: the feedback, and among your inputs the reviews that triggered it (`review-correctness.md`/`.json` and `review-verification.md`/`.json`). It comes either from the automatic review loop or from the user at gate G3. Every point must be addressed.
 
 ## Outputs
 
 - Code changes in the working tree, on the story's feature branch.
-- `subtasks/<id>/implementation.md`, containing:
-  - **Changes**: the files touched, with one line on each.
-  - **Verification**: each verification point from the item, the exact command or test you ran, and the result, either pass with key output or fail and why.
-  - **Decisions**: anything you chose that a reviewer might question.
-  - **Feedback addressed**: on a retry, each feedback point and how you handled it.
-  - **Commit**: the commit hash.
+- `subtasks/<id>/implementation.md`, with these headings:
+  - `## Changes`: the files touched, with one line on each.
+  - `## Verification`: each verification point from the item, the exact command or test you ran, and the result, either pass with key output or fail and why.
+  - `## Decisions`: anything you chose that a reviewer might question.
+  - `## Feedback addressed`: on a retry, each feedback point and how you handled it.
+  - `## Commit`: the commit hash.
+
+The engine checks the `## Changes`, `## Verification` and `## Commit` headings and that a commit hash is present. It also runs `git status` and refuses the step while tracked files have uncommitted changes.
 
 ## Procedure
 
