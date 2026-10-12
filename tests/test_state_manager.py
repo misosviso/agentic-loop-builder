@@ -22,6 +22,36 @@ SUBTASKS = {
 }
 
 
+def test_flow() -> dict:
+    """The example flow, minus what depends on the machine running the tests:
+    shell checks (git state) and the CI command (gh)."""
+    flow = json.loads(EXAMPLE_FLOW.read_text())
+    for _, unit in sm.iter_units(flow):
+        unit.pop("checks", None)
+        if "wait" in unit:
+            unit["wait"]["check"]["run"] = "true"
+    return flow
+
+
+def fill_outputs(run, act, files=None):
+    """Write outputs that satisfy the step's contracts (as the simulator does)."""
+    unit = run.resolve(act["step"])
+    agents = [a for a in unit.unit_def.get("agents", []) if any(x["agent"] == a["id"] for x in act.get("agents", []))]
+    specs = [s for ad in agents for s in sm.artifact_specs(unit.unit_def, ad)] if agents else sm.artifact_specs(unit.unit_def)
+    for spec in specs:
+        rel = run._art(spec["path"], unit)
+        content = (files or {}).get(rel)
+        if content is None:
+            content = sm._fake_output(run, unit, spec)
+            if spec.get("contains"):  # text matching the example's patterns
+                content += "\nR1\nhttps://github.com/acme/app/pull/7\ncommit 3f2a9c1\n"
+        path = run.artifacts_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content if isinstance(content, str) else json.dumps(content))
+    if act.get("items_file") and not (files or {}).get("subtasks.json"):
+        Path(act["items_file"]).write_text(json.dumps(SUBTASKS))
+
+
 class EngineTestCase(unittest.TestCase):
     flow_dict = None
 
@@ -29,7 +59,7 @@ class EngineTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.tmp_path = Path(self.tmp.name)
-        flow = self.flow_dict or json.loads(EXAMPLE_FLOW.read_text())
+        flow = self.flow_dict or test_flow()
         self.flow_path = self.tmp_path / "flow.json"
         self.flow_path.write_text(json.dumps(flow))
         self.runs = self.tmp_path / "runs"
@@ -50,9 +80,7 @@ class EngineTestCase(unittest.TestCase):
         self.assertEqual(act["action"], "run_step", act)
         self.assertEqual(act["step"], expected_step)
         self.run.start(expected_step)
-        for out in act["outputs"]:
-            rel = Path(out).relative_to(self.run.artifacts_dir).as_posix()
-            self.write(rel, (files or {}).get(rel, "content"))
+        fill_outputs(self.run, act, files)
         if act.get("agents"):
             for agent in act["agents"]:
                 res = self.run.complete(expected_step, summary=f"{agent['agent']} ok", agent=agent["agent"])
@@ -82,13 +110,13 @@ class TestValidateFlow(unittest.TestCase):
             (lambda f: f["steps"][1].update(artifacts=[]), "declares no artifacts"),
             (lambda f: f["steps"][1]["gate"].update(guard={"pattern": "x"}), "only makes sense on a 'before' gate"),
             (lambda f: f["steps"][3].update(over="jira_context"), "has no 'produces_items'"),
-            (lambda f: f["steps"][2]["produces_items"].update(item_schema="missing"), "not defined in 'item_schemas'"),
+            (lambda f: f["steps"][2]["produces_items"].update(item_schema="missing"), "not defined in 'schemas'"),
             (lambda f: f["steps"][0].update(kind="parallel"), "unknown kind"),
             (lambda f: f["steps"][4].update(id="Open-PR"), "snake_case"),
             (lambda f: f["steps"][3]["cycle"][1].update(artifacts=["subtasks/{item}/review.md"]), "would write the same file"),
             (lambda f: f["steps"][1].update(artifacts=["req-{agent}.md"]), "needs an 'agents' list"),
             (lambda f: f["steps"][3]["cycle"][1].update(run_in_subagent=False), "always run as subagents"),
-            (lambda f: f["steps"][2].update(agents=[{"id": "a"}]), "cannot produce items"),
+            (lambda f: f["steps"][2].update(agents=[{"id": "a"}]), "cannot have 'produces_items'"),
             (lambda f: f["steps"][3]["cycle"][1]["agents"].append({"id": "correctness"}), "agent 'correctness': duplicate id"),
             (lambda f: f["steps"][3]["cycle"][1].update(agents=[]), "non-empty list of parallel subagents"),
             (lambda f: f.update(orchestrator={"model": 5}), "'orchestrator' must map"),
@@ -199,8 +227,13 @@ class TestHappyPath(EngineTestCase):
         with self.assertRaises(sm.EngineError):
             self.run.start("open_pr")
         self.run.approve("G4")
-        self.do_step("open_pr")
+        res = self.do_step("open_pr")
 
+        # CI has not failed, so the fix step is skipped and the run waits on CI
+        self.assertEqual(self.run.state["steps"]["fix_ci"]["status"], "skipped")
+        wait = res["next"]
+        self.assertEqual((wait["action"], wait["step"], wait["due"]), ("wait", "ci", True))
+        self.assertEqual(self.run.poll("ci")["status"], "done")
         done = self.run.next_action()
         self.assertEqual(done["action"], "done")
         self.assertIn(str(self.run.artifacts_dir / "pr.md"), done["artifacts"])
@@ -243,8 +276,9 @@ class TestGuards(EngineTestCase):
         self.assertEqual(self.run.state["steps"]["jira_context"]["status"], "running")
 
     def test_extra_artifact_paths(self):
+        act = self.run.next_action()
         self.run.start("jira_context")
-        self.write("jira-context.md")
+        fill_outputs(self.run, act)
         self.write("notes/extra.md")
         outside = self.tmp_path / "outside.txt"
         outside.write_text("x")
@@ -258,8 +292,9 @@ class TestGuards(EngineTestCase):
         self.do_step("jira_context")
         self.do_step("requirements")
         self.run.approve("G1")
+        act = self.run.next_action()
         self.run.start("decomposition")
-        self.write("plan.md")
+        fill_outputs(self.run, act)
         self.write("subtasks.json", {"subtasks": [{"id": "T1", "title": "t", "goal": "g", "depends_on": ["T7"], "verification": ["v"]}]})
         with self.assertRaises(sm.EngineError) as cm:
             self.run.complete("decomposition")
@@ -385,20 +420,25 @@ class TestParallelAgents(EngineTestCase):
         self.do_step("subtasks[T1].implement")
         self.path = "subtasks[T1].review"
 
-    def write_reviews(self, *agents):
+    def write_reviews(self, *agents, verdict="PASS"):
         for a in agents:
-            self.write(f"subtasks/T1/review-{a}.md", f"{a} review")
+            self.write(f"subtasks/T1/review-{a}.md", f"## Verdict\n{verdict}\n\n## Findings\nnone\n")
+            self.write(f"subtasks/T1/review-{a}.json", {"verdict": verdict, "blockers": 0})
 
     def test_run_step_lists_each_agent(self):
         act = self.run.next_action()
         self.assertTrue(act["run_in_subagent"])
-        self.assertEqual(act["outputs"], [str(self.run.artifacts_dir / f"subtasks/T1/review-{a}.md") for a in ("correctness", "verification")])
+        self.assertEqual(act["outputs"], [str(self.run.artifacts_dir / f"subtasks/T1/review-{a}.{ext}")
+                                          for a in ("correctness", "verification") for ext in ("md", "json")])
         corr, ver = act["agents"]
         self.assertEqual(corr["agent"], "correctness")
         self.assertTrue(corr["skill"].endswith("steps/review.md"))
         self.assertIn("Correctness", corr["focus"])
         self.assertEqual(corr["subagent_type"], "general-purpose")
-        self.assertEqual(ver["outputs"], [str(self.run.artifacts_dir / "subtasks/T1/review-verification.md")])
+        self.assertEqual(ver["outputs"], [str(self.run.artifacts_dir / "subtasks/T1/review-verification.md"),
+                                          str(self.run.artifacts_dir / "subtasks/T1/review-verification.json")])
+        self.assertIn("`subtasks/{item}/review-verification.json`: valid JSON matching the `review_verdict` schema",
+                      ver["contract"])
         self.assertIn("--agent verification", ver["commands"]["complete"])
         self.assertNotIn("complete", act["commands"])
         self.assertEqual(self.run.start(self.path)["agents"], ["correctness", "verification"])
@@ -417,7 +457,7 @@ class TestParallelAgents(EngineTestCase):
         self.assertEqual(res["status"], "awaiting_gate")
         gate = res["next"]
         self.assertEqual(gate["gate"], "G3")
-        self.assertEqual(len(gate["review"]), 2)
+        self.assertEqual(len(gate["review"]), 4)
         self.assertEqual(gate["summary"], "correctness: 2 nits | verification: all green")
 
     def test_agent_artifacts_are_checked_per_agent(self):
@@ -441,7 +481,7 @@ class TestParallelAgents(EngineTestCase):
         self.write_reviews("verification")
         res = self.run.complete(self.path, agent="verification")
         self.assertEqual(res["status"], "awaiting_gate")
-        self.assertEqual(len(res["next"]["review"]), 2)
+        self.assertEqual(len(res["next"]["review"]), 4)
 
     def test_failing_agent_waits_for_running_siblings(self):
         self.run.start(self.path)
@@ -477,7 +517,7 @@ class TestParallelAgents(EngineTestCase):
 
 
 class TestAgentOptions(EngineTestCase):
-    flow_dict = copy.deepcopy(json.loads(EXAMPLE_FLOW.read_text()))
+    flow_dict = test_flow()
     flow_dict["defaults"]["subagent_type"] = "worker"
     flow_dict["steps"][3]["cycle"][1]["agents"][1].update(
         skill="steps/review-tests.md", subagent_type="test-runner", artifacts=["subtasks/{item}/tests.md"])
@@ -491,11 +531,12 @@ class TestAgentOptions(EngineTestCase):
         self.assertEqual((corr["subagent_type"], ver["subagent_type"]), ("worker", "test-runner"))
         self.assertTrue(ver["skill"].endswith("steps/review-tests.md"))
         self.assertEqual(ver["outputs"], [str(self.run.artifacts_dir / "subtasks/T1/tests.md")])
-        self.assertEqual(corr["outputs"], [str(self.run.artifacts_dir / "subtasks/T1/review-correctness.md")])
+        self.assertEqual(corr["outputs"], [str(self.run.artifacts_dir / "subtasks/T1/review-correctness.md"),
+                                           str(self.run.artifacts_dir / "subtasks/T1/review-correctness.json")])
 
 
 class TestIndependentItems(EngineTestCase):
-    flow_dict = copy.deepcopy(json.loads(EXAMPLE_FLOW.read_text()))
+    flow_dict = test_flow()
     flow_dict["steps"][3]["respect_item_dependencies"] = False
 
     def test_listed_order_when_dependencies_ignored(self):
@@ -508,7 +549,7 @@ class TestSimulateAndGuard(unittest.TestCase):
         trace = sm.simulate(EXAMPLE_FLOW, {"G3": 1})
         self.assertEqual(trace[-1], "done")
         self.assertIn("gate  G3 (after subtasks[T1].review) REJECTED -> back to subtasks[T1].implement", trace)
-        self.assertIn("run   subtasks[T1].implement  [attempt 2, subagent] (with feedback)", trace)
+        self.assertIn("run   subtasks[T1].implement  [attempt 2, subagent] (with feedback) + 1 check(s), not run here", trace)
         self.assertIn("run   subtasks[T1].review  [attempt 1, 2 parallel subagents: correctness, verification]", trace)
         self.assertLess(trace.index("gate  G4 (before open_pr) approved"), trace.index("run   open_pr  [attempt 1, subagent]"))
 
@@ -519,32 +560,31 @@ class TestSimulateAndGuard(unittest.TestCase):
     def test_guard(self):
         with tempfile.TemporaryDirectory() as d:
             runs = Path(d)
+            flow_path = runs / "flow.json"
+            flow_path.write_text(json.dumps(test_flow()))
             pr = {"tool_name": "Bash", "tool_input": {"command": "gh pr create --fill"}}
             self.assertIn("gate G4", sm.guard(EXAMPLE_FLOW, runs, pr))
             self.assertIsNone(sm.guard(EXAMPLE_FLOW, runs, {"tool_name": "Bash", "tool_input": {"command": "git status"}}))
             self.assertIsNone(sm.guard(EXAMPLE_FLOW, runs, {"tool_name": "Write", "tool_input": {"content": "gh pr create"}}))
 
-            run = sm.Run.create(EXAMPLE_FLOW, runs, "PROJ-9", {"story": "PROJ-9"})
+            run = sm.Run.create(flow_path, runs, "PROJ-9", {"story": "PROJ-9"})
             # walk the run to G4 using the simulator's moves
             while (act := run.next_action())["action"] == "run_step" or act["gate"] != "G4":
                 if act["action"] == "run_step":
                     run.start(act["step"])
-                    for out in act["outputs"]:
-                        content = json.dumps(SUBTASKS) if out == act.get("items_file") else "x"
-                        Path(out).parent.mkdir(parents=True, exist_ok=True)
-                        Path(out).write_text(content)
+                    fill_outputs(run, act)
                     for agent in act.get("agents") or [None]:
                         run.complete(act["step"], agent=agent and agent["agent"])
                 else:
                     run.approve(act["gate"])
             run.save()
-            self.assertIsNotNone(sm.guard(EXAMPLE_FLOW, runs, pr))  # G4 waiting, not approved
+            self.assertIsNotNone(sm.guard(flow_path, runs, pr))  # G4 waiting, not approved
             run.approve("G4")
             run.save()
-            self.assertIsNone(sm.guard(EXAMPLE_FLOW, runs, pr))
+            self.assertIsNone(sm.guard(flow_path, runs, pr))
             run.start("open_pr")
             run.save()
-            self.assertIsNone(sm.guard(EXAMPLE_FLOW, runs, pr))
+            self.assertIsNone(sm.guard(flow_path, runs, pr))
 
 
 class TestCli(unittest.TestCase):
@@ -559,19 +599,19 @@ class TestCli(unittest.TestCase):
         return p.returncode, p.stdout, p.stderr
 
     def test_cli_round_trip(self):
-        code, out, _ = self.cli("init", "--input", "story=PROJ-7")
+        code, out, _ = self.cli("init", "--input", "story=PROJ-7", "--skip-preflight")
         self.assertEqual(code, 0, out)
         res = json.loads(out)
         self.assertEqual(res["next"]["step"], "jira_context")
         self.assertIn("--run PROJ-7 start jira_context", res["next"]["commands"]["start"])
 
-        code, out, _ = self.cli("init", "--input", "story=PROJ-7")
+        code, out, _ = self.cli("init", "--input", "story=PROJ-7", "--skip-preflight")
         self.assertEqual(code, 1)
         self.assertIn("already exists", json.loads(out)["error"])
 
         self.assertEqual(self.cli("start", "jira_context")[0], 0)
         artifact = Path(self.tmp.name) / "development-loop" / "PROJ-7" / "artifacts" / "jira-context.md"
-        artifact.write_text("ctx")
+        artifact.write_text("".join(f"{h}\nx\n" for h in sm.artifact_specs(json.loads(EXAMPLE_FLOW.read_text())["steps"][0])[0]["sections"]))
         code, out, _ = self.cli("complete", "jira_context", "--summary", "fetched")
         self.assertEqual(json.loads(out)["next"]["step"], "requirements")
 
@@ -588,7 +628,7 @@ class TestCli(unittest.TestCase):
         code, out, _ = self.cli("init")
         self.assertEqual(code, 1)
         self.assertIn("--input story=", json.loads(out)["error"])
-        self.cli("init", "--input", "story=PROJ-7")
+        self.cli("init", "--input", "story=PROJ-7", "--skip-preflight")
         code, out, _ = self.cli("approve", "G1")
         self.assertEqual(code, 1)
         self.assertIn("no gate is waiting", json.loads(out)["error"])

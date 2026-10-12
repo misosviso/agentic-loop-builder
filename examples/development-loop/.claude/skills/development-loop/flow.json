@@ -6,7 +6,13 @@
   },
   "defaults": {
     "run_in_subagent": true,
-    "max_iterations": 3
+    "max_iterations": 3,
+    "max_fix_attempts": 3
+  },
+  "requires": {
+    "commands": [
+      "git"
+    ]
   },
   "orchestrator": {
     "model": "inherit",
@@ -34,7 +40,7 @@
       ]
     }
   },
-  "item_schemas": {
+  "schemas": {
     "subtask": {
       "type": "object",
       "required": [
@@ -87,6 +93,29 @@
           }
         }
       }
+    },
+    "review_verdict": {
+      "type": "object",
+      "required": [
+        "verdict",
+        "blockers"
+      ],
+      "properties": {
+        "verdict": {
+          "enum": [
+            "PASS",
+            "PASS_WITH_NITS",
+            "CHANGES_NEEDED"
+          ]
+        },
+        "blockers": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        }
+      }
     }
   },
   "steps": [
@@ -96,7 +125,16 @@
       "skill": "steps/jira-context.md",
       "subagent_type": "development-loop-jira",
       "artifacts": [
-        "jira-context.md"
+        {
+          "path": "jira-context.md",
+          "sections": [
+            "## Metadata",
+            "## Description",
+            "## Acceptance criteria",
+            "## Linked issues",
+            "## Open questions"
+          ]
+        }
       ]
     },
     {
@@ -107,7 +145,19 @@
         "jira_context"
       ],
       "artifacts": [
-        "requirements.md"
+        {
+          "path": "requirements.md",
+          "sections": [
+            "## Summary",
+            "## Scope",
+            "## Functional requirements",
+            "## Assumptions",
+            "## Open questions"
+          ],
+          "contains": [
+            "\\bR1\\b"
+          ]
+        }
       ],
       "gate": {
         "id": "G1",
@@ -127,7 +177,14 @@
       ],
       "artifacts": [
         "subtasks.json",
-        "plan.md"
+        {
+          "path": "plan.md",
+          "sections": [
+            "## Overview",
+            "## Subtasks",
+            "## Coverage"
+          ]
+        }
       ],
       "produces_items": {
         "file": "subtasks.json",
@@ -155,8 +212,29 @@
           "skill": "steps/implement.md",
           "subagent_type": "development-loop-implementer",
           "artifacts": [
-            "subtasks/{item}/implementation.md"
-          ]
+            {
+              "path": "subtasks/{item}/implementation.md",
+              "sections": [
+                "## Changes",
+                "## Verification",
+                "## Commit"
+              ],
+              "contains": [
+                "\\b[0-9a-f]{7,40}\\b"
+              ]
+            }
+          ],
+          "checks": [
+            {
+              "name": "changes are committed",
+              "run": "test -z \"$(git status --porcelain --untracked-files=no)\""
+            }
+          ],
+          "requires": {
+            "commands": [
+              "git"
+            ]
+          }
         },
         {
           "id": "review",
@@ -172,12 +250,41 @@
             }
           ],
           "artifacts": [
-            "subtasks/{item}/review-{agent}.md"
+            {
+              "path": "subtasks/{item}/review-{agent}.md",
+              "sections": [
+                "## Verdict",
+                "## Findings"
+              ]
+            },
+            {
+              "path": "subtasks/{item}/review-{agent}.json",
+              "json_schema": "review_verdict"
+            }
           ],
+          "repeat": {
+            "until": {
+              "all": [
+                {
+                  "file": "subtasks/{item}/review-correctness.json",
+                  "field": "verdict",
+                  "not_equals": "CHANGES_NEEDED"
+                },
+                {
+                  "file": "subtasks/{item}/review-verification.json",
+                  "field": "verdict",
+                  "not_equals": "CHANGES_NEEDED"
+                }
+              ]
+            },
+            "back_to": "implement",
+            "max": 3,
+            "on_exhausted": "gate"
+          },
           "gate": {
             "id": "G3",
             "on_reject": "implement",
-            "prompt": "Two reviewers (correctness, verification) looked at this subtask in parallel. Read both reviews (and the diff if you want). Approve to move on, or reject with feedback to send it back to implementation."
+            "prompt": "Two reviewers (correctness, verification) passed this subtask, or gave up after 3 automatic rounds (the summary says so). Read their reviews, and the diff if you want. Approve to move on, or reject with feedback to send it back to implementation."
           }
         }
       ]
@@ -195,7 +302,15 @@
         "subtasks"
       ],
       "artifacts": [
-        "pr.md"
+        {
+          "path": "pr.md",
+          "sections": [
+            "## Pull request"
+          ],
+          "contains": [
+            "https?://\\S+/pull/\\d+"
+          ]
+        }
       ],
       "gate": {
         "id": "G4",
@@ -205,6 +320,79 @@
           "tool": "Bash",
           "pattern": "gh\\s+pr\\s+create"
         }
+      },
+      "requires": {
+        "commands": [
+          "gh",
+          "git"
+        ]
+      }
+    },
+    {
+      "id": "fix_ci",
+      "kind": "single",
+      "skill": "steps/fix-ci.md",
+      "description": "Runs only after CI failed on the pull request; the CI wait sends the run back here.",
+      "subagent_type": "development-loop-implementer",
+      "when": {
+        "file": "ci.status.json",
+        "field": "status",
+        "equals": "failed"
+      },
+      "needs": [
+        "open_pr"
+      ],
+      "inputs": [
+        "requirements",
+        "open_pr"
+      ],
+      "artifacts": [
+        {
+          "path": "ci-fix.md",
+          "sections": [
+            "## Failure",
+            "## Fix",
+            "## Commit"
+          ]
+        }
+      ],
+      "checks": [
+        {
+          "name": "fix is committed and pushed",
+          "run": "test -z \"$(git status --porcelain --untracked-files=no)\" && test -z \"$(git log @{u}..HEAD --oneline)\""
+        }
+      ],
+      "requires": {
+        "commands": [
+          "git"
+        ]
+      },
+      "max_iterations": 3
+    },
+    {
+      "id": "ci",
+      "kind": "single",
+      "needs": [
+        "fix_ci"
+      ],
+      "wait": {
+        "description": "CI checks on the pull request",
+        "check": {
+          "run": "sh .claude/skills/development-loop/scripts/ci_status.sh",
+          "failed_exit_codes": [
+            1
+          ]
+        },
+        "poll_every": "3m",
+        "timeout": "2h",
+        "on_failure": {
+          "back_to": "fix_ci"
+        }
+      },
+      "requires": {
+        "commands": [
+          "gh"
+        ]
       }
     }
   ]

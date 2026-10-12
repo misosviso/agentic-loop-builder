@@ -29,15 +29,24 @@ Stay in your lane so the two reviews don't duplicate each other. Still, if you n
 
 ## Outputs
 
-- `subtasks/<id>/review-<focus>.md`, your own file only, structured like this:
-  - **Focus**: `correctness` or `verification`.
-  - **Verdict**: `PASS`, `PASS WITH NITS` or `CHANGES NEEDED`, plus one sentence explaining it.
-  - **Evidence**:
+Two files, both your own:
+
+- `subtasks/<id>/review-<focus>.md`, with these headings:
+  - `## Verdict`: `PASS`, `PASS WITH NITS` or `CHANGES NEEDED`, plus one sentence explaining it.
+  - `## Evidence`:
     - For `verification`: every verification point, the command you ran, the result, and whether it matches what `implementation.md` claims.
     - For `correctness`: the files and functions you reviewed.
-  - **Findings**: numbered, each with a severity (blocker, major or nit), a `path:line`, what is wrong, and a suggested fix.
-  - **Previous findings**: on later rounds, whether each earlier finding in your focus is fixed.
-  - **Suggested feedback**: if the verdict is CHANGES NEEDED, a ready-to-use feedback paragraph the user can pass at G3.
+  - `## Findings`: numbered, each with a severity (blocker, major or nit), a `path:line`, what is wrong, and a suggested fix. Write "none" if there are none.
+  - `## Previous findings`: on later rounds, whether each earlier finding in your focus is fixed.
+- `subtasks/<id>/review-<focus>.json`, the machine-readable verdict:
+
+  ```json
+  {"verdict": "PASS" | "PASS_WITH_NITS" | "CHANGES_NEEDED", "blockers": 0, "summary": "one line"}
+  ```
+
+  `blockers` is the number of blocker findings. Any blocker means `CHANGES_NEEDED`.
+
+**The JSON drives the loop.** If either reviewer says `CHANGES_NEEDED`, the engine automatically sends the subtask back to implementation, with both reviews as input, for up to 3 rounds. The user sees the work at gate G3 only once both reviewers pass it, or after the third round. So a `CHANGES_NEEDED` must name findings the implementer can act on.
 
 ## Procedure
 
@@ -50,7 +59,7 @@ Stay in your lane so the two reviews don't duplicate each other. Still, if you n
 
 - [ ] Your review covers your focus completely, with evidence for each claim.
 - [ ] Every finding has a location and a concrete fix.
-- [ ] The verdict is consistent with the findings: any blocker means CHANGES NEEDED.
+- [ ] The verdict is consistent with the findings: any blocker means `CHANGES_NEEDED`, and the `.md` and `.json` verdicts agree.
 
 ## Constraints
 

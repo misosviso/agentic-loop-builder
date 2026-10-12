@@ -180,10 +180,170 @@ class TestGenerate(unittest.TestCase):
         flow = sm.load_flow(EXAMPLE / "flow.json")
         schema = scaffold.state_schema(flow)
         self.assertEqual(schema["properties"]["steps"]["required"],
-                         ["jira_context", "requirements", "decomposition", "subtasks", "open_pr"])
+                         ["jira_context", "requirements", "decomposition", "subtasks", "open_pr", "fix_ci", "ci"])
         item = schema["properties"]["steps"]["properties"]["subtasks"]["properties"]["items"]["items"]
         self.assertEqual(item["properties"]["steps"]["required"], ["implement", "review"])
         self.assertIn("agents", schema["$defs"]["unit"]["properties"])
+
+
+class TestCapabilities(unittest.TestCase):
+    """Can each step's subagent actually do the step?"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.agents = Path(self.tmp.name) / "agents"
+        self.agents.mkdir()
+
+    def report(self, steps, subagents=None):
+        flow = {"name": "demo", "steps": steps, "subagents": subagents or {}}
+        return scaffold.capability_report(flow, [self.agents])
+
+    def test_read_only_reviewer_cannot_write_its_review(self):
+        errors, _ = self.report(
+            [{"id": "review", "skill": "r.md", "artifacts": ["review.md"], "subagent_type": "demo-reviewer"}],
+            {"demo-reviewer": {"description": "reviews", "tools": ["Read", "Grep"]}})
+        self.assertEqual(len(errors), 1)
+        self.assertIn("step 'review' (subagent `demo-reviewer`) must write its output files but has no Write, Edit or Bash tool",
+                      errors[0])
+
+    def test_shell_only_writer_is_a_warning(self):
+        errors, warnings = self.report(
+            [{"id": "a", "skill": "a.md", "artifacts": ["a.md"], "subagent_type": "demo-shell"}],
+            {"demo-shell": {"description": "x", "tools": "Read, Bash"}})
+        self.assertEqual(errors, [])
+        self.assertIn("would have to use the shell", warnings[0])
+
+    def test_required_tools_commands_and_mcp(self):
+        errors, _ = self.report(
+            [{"id": "fetch", "skill": "f.md", "artifacts": ["f.md"], "subagent_type": "demo-fetch",
+              "requires": {"commands": ["acli"], "mcp": ["atlassian"], "tools": ["WebFetch"]}}],
+            {"demo-fetch": {"description": "x", "tools": ["Read", "Write"]}})
+        text = "\n".join(errors)
+        self.assertIn("needs the `WebFetch` tool", text)
+        self.assertIn("needs to run acli but has no Bash tool", text)
+        self.assertIn("needs the `atlassian` MCP server's tools", text)
+        errors, _ = self.report(
+            [{"id": "fetch", "skill": "f.md", "artifacts": ["f.md"], "subagent_type": "demo-fetch",
+              "requires": {"commands": ["acli"], "mcp": ["atlassian", "slack"], "tools": ["WebFetch"]}}],
+            {"demo-fetch": {"description": "x",
+                            "tools": ["Read", "Write", "Bash(acli:*)", "WebFetch", "mcp__atlassian__*", "mcp__slack"]}})
+        self.assertEqual(errors, [])
+
+    def test_disallowed_tools_and_builtins(self):
+        errors, _ = self.report(
+            [{"id": "a", "skill": "a.md", "artifacts": ["a.md"], "subagent_type": "demo-x"},
+             {"id": "b", "skill": "b.md", "artifacts": ["b.md"], "subagent_type": "Explore"},
+             {"id": "c", "skill": "c.md", "artifacts": ["c.md"]}],
+            {"demo-x": {"description": "x", "disallowedTools": ["Write", "Edit", "Bash"]}})
+        self.assertEqual([e.split(" (subagent")[0] for e in errors], ["step 'a'", "step 'b'"])
+
+    def test_existing_agent_files_are_read(self):
+        (self.agents / "my-writer.md").write_text("---\nname: my-writer\ntools:\n  - Read\n  - Grep\n---\nbody\n")
+        errors, warnings = self.report([
+            {"id": "a", "skill": "a.md", "artifacts": ["a.md"], "subagent_type": "my-writer"},
+            {"id": "b", "skill": "b.md", "artifacts": ["b.md"], "subagent_type": "nobody-knows"}])
+        self.assertIn("my-writer.md", errors[0])
+        self.assertIn("agent not found", warnings[0])
+
+    def test_parallel_agents_and_engine_run_waits(self):
+        errors, _ = self.report([
+            {"id": "review", "skill": "r.md", "artifacts": ["r-{agent}.md"],
+             "agents": [{"id": "ok"}, {"id": "ro", "subagent_type": "Plan"}]},
+            {"id": "ci", "wait": {"check": {"run": "true"}}}])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("step 'review' agent 'ro' (subagent `Plan`)", errors[0])
+
+    def test_validate_raises_on_capability_errors(self):
+        flow = json.loads((EXAMPLE / "flow.json").read_text())
+        flow["subagents"]["development-loop-jira"]["tools"] = ["Read"]
+        path = Path(self.tmp.name) / "flow.json"
+        path.write_text(json.dumps(flow))
+        with self.assertRaises(sm.EngineError) as cm:
+            scaffold.validate(path, self.agents)
+        self.assertIn("step 'jira_context' (subagent `development-loop-jira`) must write its output files", str(cm.exception))
+
+
+class TestReadinessCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write_flow(self, flow):
+        path = Path(self.tmp.name) / "flow.json"
+        path.write_text(json.dumps(flow))
+        return path
+
+    def test_example_is_ready(self):
+        report = scaffold.check(EXAMPLE / "flow.json", EXAMPLE_ROOT / "agents", environment=False)
+        self.assertTrue(report["ok"], report["errors"])
+        self.assertEqual(report["gaps"], [])
+        scenarios = {p["scenario"]: p["end"] for p in report["paths"]}
+        self.assertEqual(scenarios["happy path"], "done")
+        self.assertEqual(scenarios["'review' repeat condition never passes"], "done")  # on_exhausted: gate
+        self.assertEqual(scenarios["wait 'ci' reports failure once"], "done")
+        self.assertTrue(scenarios["wait 'ci' fails every time"].startswith("FAILED fix_ci"))
+        self.assertTrue(scenarios["gate G3 rejected every time"].startswith("FAILED"))
+        text = scaffold.render_check(report)
+        self.assertTrue(text.startswith("READY for a first run"))
+
+    def test_gaps_endless_loops_and_environment(self):
+        path = self.write_flow({"name": "demo", "requires": {"commands": ["definitely-not-installed-xyz"]}, "steps": [
+            {"id": "a", "skill": "a.md", "artifacts": ["a.md"], "max_iterations": 100000, "gate": {"id": "G1"}}]})
+        report = scaffold.check(path)
+        self.assertFalse(report["ok"])
+        text = "\n".join(report["errors"])
+        self.assertIn("environment: command `definitely-not-installed-xyz` is not on PATH", text)
+        self.assertIn("path 'gate G1 rejected every time' ends with: stopped after", text)
+        self.assertIn("'a': a.md only need to exist", report["gaps"][0])
+        self.assertTrue(scaffold.render_check(report).startswith("NOT READY"))
+
+    def test_invalid_flow(self):
+        report = scaffold.check(self.write_flow({"name": "demo", "steps": [{"id": "a", "skil": "a.md"}]}))
+        self.assertFalse(report["ok"])
+        self.assertIn("did you mean 'skill'", report["errors"][0])
+
+    def test_cli_exit_codes(self):
+        import subprocess
+        ok = subprocess.run([sys.executable, str(BUILDER / "scaffold.py"), "check", str(EXAMPLE / "flow.json"), "--no-env"],
+                            capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stdout)
+        bad = subprocess.run([sys.executable, str(BUILDER / "scaffold.py"), "check", "--json",
+                              str(self.write_flow({"name": "demo", "steps": []}))], capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 1)
+        self.assertFalse(json.loads(bad.stdout)["ok"])
+
+
+class TestGeneratedDocs(unittest.TestCase):
+    def test_stub_lists_what_is_checked(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / ".claude" / "skills" / "loop"
+            scaffold.generate(EXAMPLE / "flow.json", out)
+            impl = (out / "steps/implement.md").read_text()
+            self.assertIn("## Checked automatically", impl)
+            self.assertIn("`subtasks/{item}/implementation.md`: must have the headings `## Changes`, `## Verification`, `## Commit`",
+                          impl)
+            self.assertIn("the command `test -z \"$(git status --porcelain --untracked-files=no)\"` must exit 0", impl)
+            self.assertIn("step fails after 3 refusals", impl)
+            self.assertFalse((out / "steps" / "ci.md").exists())  # the engine runs the CI check itself
+
+    def test_plain_outputs_are_flagged_in_the_stub(self):
+        flow = {"name": "demo", "steps": [{"id": "a", "skill": "steps/a.md", "artifacts": ["a.md"]}]}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "flow.json"
+            path.write_text(json.dumps(flow))
+            scaffold.generate(path, Path(d) / "out", with_agent=False)
+            self.assertIn("TODO: only that the output files exist", (Path(d) / "out/steps/a.md").read_text())
+
+    def test_table_shows_conditions_loops_and_waits(self):
+        table = scaffold.steps_table(sm.load_flow(EXAMPLE / "flow.json"))
+        self.assertIn("| Artifacts (✓ = contract) | Subagents | Runs when / loops / waits |", table)
+        self.assertIn("checks: changes are committed", table)
+        self.assertIn('only if ci.status.json → status == "failed"', table)
+        self.assertIn("max 3 rounds → `implement`; then gate", table)
+        self.assertIn("waits on `sh .claude/skills/development-loop/scripts/ci_status.sh` every 3m, up to 2h; on failure → `fix_ci`",
+                      table)
+        self.assertIn("none (the engine runs the check)", table)
 
 
 class TestExampleIsInSync(unittest.TestCase):

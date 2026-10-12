@@ -28,7 +28,12 @@ Split the approved requirements into small subtasks that can each be implemented
   | `requirements` | no | Which `R<n>` this subtask covers |
 
   The engine validates this file when you finish. It rejects unknown dependency ids, self-dependencies, dependency cycles and missing fields.
-- `plan.md`: a readable version of the same plan for the user. Include a short overview, a table of subtasks (id, title, depends on, requirements covered), and a coverage check showing that every `R<n>` is covered by at least one subtask.
+- `plan.md`: a readable version of the same plan for the user, with these headings:
+  - `## Overview`: the approach in a few sentences.
+  - `## Subtasks`: a table of subtasks with id, title, depends on, and requirements covered.
+  - `## Coverage`: every `R<n>` and the subtasks covering it.
+
+The engine checks these headings when you finish and refuses the file if one is missing, so use them exactly, each on its own line.
 
 ## Procedure
 

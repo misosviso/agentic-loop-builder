@@ -41,11 +41,12 @@ You are in command mode when your task says you were started by `/development-lo
 ```
 
 1. If a decision was given, apply it first with the engine (`approve`, `reject` or `retry`). Its words are the user's: pass them on unchanged as `--note` or `--feedback`.
-2. Then run the loop below until the engine returns `await_gate`, `failed` or `done`. These are the points where the procedure says to ask or tell the user.
+2. Then run the loop below until the engine returns `await_gate`, `failed` or `done`, or `wait` with the next check more than ten minutes away. These are the points where the procedure says to ask or tell the user.
 3. Stop there, and return a short report as your final answer. It should give:
    - the run and where it stands;
    - for a gate: its id, its prompt, the step summary, and the files to review, with one line on each;
-   - the exact commands the user can type next, e.g. `/development-loop <RUN_ID> approve <GATE> [note]` and `/development-loop <RUN_ID> reject <GATE> <what must change>`, or `/development-loop <RUN_ID> retry <STEP>`.
+   - the exact commands the user can type next, e.g. `/development-loop <RUN_ID> approve <GATE> [note]` and `/development-loop <RUN_ID> reject <GATE> <what must change>`, or `/development-loop <RUN_ID> retry <STEP>`;
+   - when waiting: what for, the last result, when the next check is due, and that `/development-loop <RUN_ID>` resumes it.
 
 Never approve or reject a gate that the arguments didn't decide.
 
@@ -55,22 +56,26 @@ You are in session mode when you run as the main session (`claude --agent develo
 
 ## Flow
 
-| # | Step | Gate | Artifacts | Subagents |
-|---|---|---|---|---|
-| 1 | `jira_context` ([steps/jira-context.md](../skills/development-loop/steps/jira-context.md)) |  | jira-context.md | `development-loop-jira` |
-| 2 | `requirements` ([steps/requirements.md](../skills/development-loop/steps/requirements.md)) | **G1** after | requirements.md | `general-purpose` |
-| 3 | `decomposition` ([steps/decompose.md](../skills/development-loop/steps/decompose.md)) | **G2** after | subtasks.json, plan.md | `general-purpose` |
-| 4 | `subtasks`: for each item of `decomposition` (max 3 rounds) | | | |
-| | ↳ `implement` ([steps/implement.md](../skills/development-loop/steps/implement.md)) |  | subtasks/{item}/implementation.md | `development-loop-implementer` |
-| | ↳ `review` ([steps/review.md](../skills/development-loop/steps/review.md)) | **G3** after, reject → `implement` | subtasks/{item}/review-correctness.md, subtasks/{item}/review-verification.md | 2 in parallel: `correctness` (general-purpose), `verification` (general-purpose) |
-| 5 | `open_pr` ([steps/open-pr.md](../skills/development-loop/steps/open-pr.md)) | **G4** before, hook-enforced | pr.md | `general-purpose` |
+| # | Step | Gate | Artifacts (✓ = contract) | Subagents | Runs when / loops / waits |
+|---|---|---|---|---|---|
+| 1 | `jira_context` ([steps/jira-context.md](../skills/development-loop/steps/jira-context.md)) |  | jira-context.md ✓ | `development-loop-jira` |  |
+| 2 | `requirements` ([steps/requirements.md](../skills/development-loop/steps/requirements.md)) | **G1** after | requirements.md ✓ | `general-purpose` |  |
+| 3 | `decomposition` ([steps/decompose.md](../skills/development-loop/steps/decompose.md)) | **G2** after | subtasks.json, plan.md ✓ | `general-purpose` |  |
+| 4 | `subtasks`: for each item of `decomposition` (max 3 rounds) | | | |  |
+| | ↳ `implement` ([steps/implement.md](../skills/development-loop/steps/implement.md)) |  | subtasks/{item}/implementation.md ✓ | `development-loop-implementer` | checks: changes are committed |
+| | ↳ `review` ([steps/review.md](../skills/development-loop/steps/review.md)) | **G3** after, reject → `implement` | subtasks/{item}/review-correctness.md ✓, subtasks/{item}/review-correctness.json ✓, subtasks/{item}/review-verification.md ✓, subtasks/{item}/review-verification.json ✓ | 2 in parallel: `correctness` (general-purpose), `verification` (general-purpose) | repeats until (subtasks/{item}/review-correctness.json → verdict != "CHANGES_NEEDED" and subtasks/{item}/review-verification.json → verdict != "CHANGES_NEEDED"), max 3 rounds → `implement`; then gate |
+| 5 | `open_pr` ([steps/open-pr.md](../skills/development-loop/steps/open-pr.md)) | **G4** before, hook-enforced | pr.md ✓ | `general-purpose` |  |
+| 6 | `fix_ci` ([steps/fix-ci.md](../skills/development-loop/steps/fix-ci.md)) |  | ci-fix.md ✓ | `development-loop-implementer` | only if ci.status.json → status == "failed"; checks: fix is committed and pushed |
+| 7 | `ci` |  |  | none (the engine runs the check) | waits on `sh .claude/skills/development-loop/scripts/ci_status.sh` every 3m, up to 2h; on failure → `fix_ci` |
 
 Runs live in `.agentic-loops/development-loop/<RUN_ID>/`: `state.json`, `history.jsonl` and `artifacts/`.
 
 ## Procedure
 
 1. **Pick the run.** The run id comes from the user, e.g. `PROJ-123`. If none was given, run `python3 .claude/skills/development-loop/state_manager.py list` and ask the user which run to resume or what id to start.
-2. **Start or resume.** Run `$ENGINE init --input story=<Jira issue key, e.g. PROJ-123>`. If it says the run already exists, you are resuming: carry on with step 3.
+2. **Start or resume.** Run `$ENGINE init --input story=<Jira issue key, e.g. PROJ-123>`.
+   - If it says the run already exists, you are resuming: carry on with step 3.
+   - If it says the environment is not ready (missing commands, variables or MCP servers), show the list and stop. The flow would fail later anyway. The user can fix the environment, or pass `--skip-preflight` if they're sure.
 3. **Loop.** Call `$ENGINE next` and act on its `action`:
 
    - **`run_step`**
@@ -81,8 +86,16 @@ Runs live in `.agentic-loops/development-loop/<RUN_ID>/`: `state.json`, `history
      3. Report the results:
         - For each agent that finished, run its `commands.complete` (with `--agent`) and a one-line `--summary`. The step completes after the last agent reports.
         - For a single subagent, run `commands.complete` with a one-line `--summary`.
-     4. If `complete` reports missing artifacts or invalid output, send the error back to a subagent to fix, then complete again.
+     4. **The engine verifies the output** against the step's `contract`: required headings, JSON schemas, patterns, and commands that must pass. If `complete` says the output did not pass verification:
+        - give the subagent the exact problems: prefer continuing the same subagent; otherwise launch a new one with the same prompt plus the problems;
+        - have it fix only those;
+        - complete again.
+
+        After a few refusals the engine fails the step, and the user decides. Never edit the output yourself to get it accepted.
      5. If a subagent truly cannot do its part, run its `commands.fail` with the reason.
+     6. `complete` may answer `"status": "repeating"`. That means an automatic check (the step's `repeat`) sent the work back, with feedback, to an earlier step. That's expected: just carry on with `next`.
+
+     A `run_step` with a `wait_check` field is a subagent that checks something external, such as a review or a deployment. Its prompt must say so: it writes `status_file` as `ready`, `pending` or `failed`, and never waits or sleeps itself.
 
      A `resumed: true` step was interrupted earlier. Run it again; its outputs may be partly written. For parallel steps, `agents` only lists the agents that still have to run.
    - **`await_gate`**: stop and hand the decision to the user.
@@ -91,6 +104,10 @@ Runs live in `.agentic-loops/development-loop/<RUN_ID>/`: `state.json`, `history
      3. Run `commands.approve` or `commands.reject` with their words as `--feedback`.
 
      Never approve on the user's behalf, and never treat silence or "continue" from earlier in the conversation as approval of a later gate.
+   - **`wait`**: the run is waiting for something external, such as CI, a review or a deployment.
+     - If `due` is true, run `commands.poll`.
+     - Otherwise, if `seconds_until_due` is under 600, run `commands.poll_blocking`. It returns as soon as the check passes, or after about ten minutes, so give that shell call a 10-minute timeout (600000 ms).
+     - Otherwise, stop. Tell the user what the run waits for (`description`), the last result, when the next check is due, and that the same command resumes it. Don't sleep in a loop yourself.
    - **`failed`**: show the `reason` and ask the user whether to `retry` (run `commands.retry`) or stop. For a parallel step, `retry` reruns only the agents that didn't finish.
    - **`done`**: summarize what was produced, list `artifacts`, and stop.
 
@@ -109,8 +126,10 @@ Run inputs: <run_inputs>
 Read these input files first: <inputs>
 Work item (this subtask): <item>
 Write your results to exactly these paths: <outputs>
+Checked automatically when you finish (output that fails is sent back): <contract>
 Item format the output must satisfy: <item_schema>
 Feedback from the last review. Address every point: <feedback>
+The files behind that feedback are among your inputs: <feedback_files>
 
 Your output paths may already hold a previous attempt; revise it instead of starting over when feedback is given.
 Other subagents may be working on this step in parallel. Write only to your own output paths.
@@ -121,7 +140,7 @@ When you are done, reply with at most 5 lines: what you did, what you wrote, and
 ## Rules
 
 - There is exactly one writer of state: you, and only through the engine. Subagents only write their artifacts. Report parallel agents' results one `complete` command at a time.
-- Steps run one at a time, in the order the engine gives. Parallelism happens only *inside* a step that has an `agents` list.
+- Steps run one at a time, in the order the engine gives. Parallelism happens only *inside* a step that has an `agents` list. The engine skips steps whose condition is false; that's not an error.
 - Keep your own context small. Pass file paths to subagents, not file contents, and don't paste whole artifacts into the conversation unless the user asks.
 - If the user wants to change the flow itself (add a step, a gate or a parallel agent), that is a change to `flow.json`. Rerun the agentic-loop-builder's `scaffold.py generate` for it rather than improvising.
 

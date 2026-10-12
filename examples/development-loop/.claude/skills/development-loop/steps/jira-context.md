@@ -12,15 +12,16 @@ Collect everything known about the story into one self-contained file. Every lat
 
 ## Outputs
 
-- `jira-context.md`, with these sections in this order:
-  - `# <KEY>: <summary>`
-  - **Metadata**: type, status, priority, assignee, reporter, labels, components, fix version, sprint, and a link to the issue.
-  - **Description**: the issue description verbatim, converted to Markdown.
-  - **Acceptance criteria**: verbatim if the issue has them, otherwise "none stated".
-  - **Linked issues**: the parent or epic, subtasks, blocks and is-blocked-by, and relates-to. Give each a key, summary, status and one line on why it matters.
-  - **Discussion**: comments that change or clarify scope, quoted with author and date. Skip noise.
-  - **Attachments and links**: names and URLs, plus a one-line note on what each one is.
-  - **Open questions**: contradictions, gaps and unclear terms you noticed. Don't resolve them here.
+- `jira-context.md`: a `# <KEY>: <summary>` title, then these headings in this order:
+  - `## Metadata`: type, status, priority, assignee, reporter, labels, components, fix version, sprint, and a link to the issue.
+  - `## Description`: the issue description verbatim, converted to Markdown.
+  - `## Acceptance criteria`: verbatim if the issue has them, otherwise "none stated".
+  - `## Linked issues`: the parent or epic, subtasks, blocks and is-blocked-by, and relates-to. Give each a key, summary, status and one line on why it matters. Write "none" if there are none.
+  - `## Discussion`: comments that change or clarify scope, quoted with author and date. Skip noise.
+  - `## Attachments and links`: names and URLs, plus a one-line note on what each one is.
+  - `## Open questions`: contradictions, gaps and unclear terms you noticed. Don't resolve them here.
+
+The engine checks these headings when you finish and refuses the file if one is missing, so use them exactly, each on its own line.
 
 ## Procedure
 
@@ -30,11 +31,11 @@ Collect everything known about the story into one self-contained file. Every lat
    - the Jira REST API, `GET /rest/api/3/issue/<KEY>?expand=renderedFields`, using credentials from the environment (`JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`).
 2. Fetch the parent or epic and directly linked issues, one level deep only.
 3. Write `jira-context.md`.
-4. If no source works, don't guess. Write a `jira-context.md` that contains only the heading and a note that Jira was unreachable, and explain this in your reply. The orchestrator will ask the user to paste the story.
+4. If no source works, don't guess and don't write a placeholder file. Explain in your reply which sources you tried and what failed. The orchestrator then fails the step, so the user can fix access or paste the story.
 
 ## Done when
 
-- [ ] Every section above is present, using "none" where it is empty.
+- [ ] Every heading above is present, with "none" where a section is empty.
 - [ ] The description and acceptance criteria are verbatim, not paraphrased.
 - [ ] Nothing in the file is inferred. Anything uncertain sits under **Open questions**.
 
